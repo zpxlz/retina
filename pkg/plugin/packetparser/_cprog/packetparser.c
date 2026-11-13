@@ -1,3 +1,5 @@
+//go:build ignore
+
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
@@ -5,116 +7,158 @@
 #include "bpf_helpers.h"
 #include "bpf_endian.h"
 #include "packetparser.h"
+#include "conntrack.c"
+#include "conntrack.h"
 #include "retina_filter.c"
 #include "dynamic.h"
 
 char __license[] SEC("license") = "Dual MIT/GPL";
 
-
-struct tcpmetadata {
-	__u32 seq; // TCP sequence number
-	__u32 ack_num; // TCP ack number
-	// TCP flags.
-	__u16 syn;
-	__u16 ack;
-	__u16 fin;
-	__u16 rst;
-	__u16 psh;
-	__u16 urg;
-	__u32 tsval; // TCP timestamp value
-	__u32 tsecr; // TCP timestamp echo reply
-};
-
-struct packet
-{
-	// 5 tuple.
-	__u32 src_ip;
-	__u32 dst_ip;
-	__u16 src_port;
-	__u16 dst_port;
-	__u8 proto;
-	struct tcpmetadata tcp_metadata; // TCP metadata
-	direction dir; // 0 -> INGRESS, 1 -> EGRESS
-	__u64 ts; // timestamp in nanoseconds
-	__u64 bytes; // packet size in bytes
-};
-
 struct
 {
+#ifdef USE_RING_BUFFER
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+#ifndef RING_BUFFER_SIZE
+#define RING_BUFFER_SIZE (8 * 1024 * 1024)
+#endif
+	__uint(max_entries, RING_BUFFER_SIZE);
+#else
 	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
 	__uint(max_entries, 16384);
-} packetparser_events SEC(".maps");
+#endif
+} retina_packetparser_events SEC(".maps");
+
+// Counts events dropped in the kernel when the event buffer write fails.
+struct
+{
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} retina_packetparser_metrics SEC(".maps");
+
+static __always_inline void submit_packetparser_event(struct __sk_buff *skb, struct packet *p)
+{
+	long ret;
+#ifdef USE_RING_BUFFER
+	ret = bpf_ringbuf_output(&retina_packetparser_events, p, sizeof(*p), 0);
+#else
+	ret = bpf_perf_event_output(skb, &retina_packetparser_events, BPF_F_CURRENT_CPU, p, sizeof(*p));
+#endif
+	if (ret < 0) {
+		__u32 zero = 0;
+		__u64 *dropped = bpf_map_lookup_elem(&retina_packetparser_metrics, &zero);
+		// Atomic because a non-atomic read-modify-write can lose counts if this hook is
+		// preempted mid-update on the same CPU.
+		if (dropped)
+			__sync_fetch_and_add(dropped, 1);
+	}
+}
 
 // Define const variables to avoid warnings.
 const struct packet *unused __attribute__((unused));
 
 /*
- * Full credit to authors of pping_kern.c for the parse_tcp_ts function.
- * https://github.com/xdp-project/bpf-examples/blob/bc9df640cb9e5a541a7425ca2e66174ae22a18e3/pping/pping_kern.c#L316
- * 
  * Parses the TSval and TSecr values from the TCP options field. If sucessful
  * the TSval and TSecr values will be stored at tsval and tsecr (in network
  * byte order).
  * Returns 0 if sucessful and -1 on failure
- */
-static int parse_tcp_ts(struct tcphdr *tcph, void *data_end, __u32 *tsval,
-			__u32 *tsecr)
-{
-	int len = tcph->doff << 2;
-	void *opt_end = (void *)tcph + len;
-	__u8 *pos = (__u8 *)(tcph + 1); //Current pos in TCP options
-	__u8 i, opt;
-	volatile __u8
-		opt_size; // Seems to ensure it's always read of from stack as u8
+ *
+   +-------+-------+---------------------+---------------------+
+   |Kind=8 |  10   | TS Value (TSval)    |TS Echo Reply (TSecr)|
+   +-------+-------+---------------------+---------------------+
+	  1       1               4                      4
+ * Reference: 
+ * - https://github.com/xdp-project/bpf-examples
+ * - https://www.ietf.org/rfc/rfc9293.html
+ * - https://www.rfc-editor.org/rfc/pdfrfc/rfc7323.txt.pdf
+ * May explore using bpf_loop() in the future (kernel 5.17+)
+*/
+static int parse_tcp_ts(struct tcphdr *tcph, void *data_end, __u32 *tsval, __u32 *tsecr) {
+	// Get the length of the TCP header.
+	// The length is in 4-byte words, so we need to multiply it by 4 (bit shift left 2) to get the length in bytes.
+	__u8 tcp_header_len = tcph->doff << 2;
+	volatile __u8 opt_len;
+	__u8 opt_kind, i;
 
-	if (tcph + 1 > data_end || len <= sizeof(struct tcphdr))
+	// Verify that the options field is present.
+	// If the header length is less than or equal to the default size of the TCP header, then there are no options.
+	if (tcp_header_len <= sizeof(struct tcphdr)) {
 		return -1;
-#pragma unroll //temporary solution until we can identify why the non-unrolled loop gets stuck in an infinite loop
-	for (i = 0; i < MAX_TCP_OPTIONS; i++) {
-		if (pos + 1 > opt_end || pos + 1 > data_end)
-			return -1;
+	}
 
-		opt = *pos;
-		if (opt == 0) // Reached end of TCP options
-			return -1;
+	// Get the pointer to the end of the TCP header options field.
+	__u8 *tcp_opt_end_ptr = (__u8 *)tcph + tcp_header_len;
 
-		if (opt == 1) { // TCP NOP option - advance one byte
-			pos++;
-			continue;
+	// Check that adding 1 to the start of the TCP header will not go past the end of the packet.
+	// We need this to get to the start of the options field.
+	if ((__u8 *)tcph + 1 > (__u8 *)data_end) {
+		return -1;
+	}
+
+	// Get the pointer to the start of the options field.
+	__u8 *tcp_options_cur_ptr = (__u8 *)(tcph + 1);
+
+	// Loop through the options field to find the TSval and TSecr values.
+	// MAX_TCP_OPTIONS_LEN is used to prevent infinite loops and the fact that the options field is at most 40 bytes long.
+	#pragma unroll
+	for (i = 0; i < MAX_TCP_OPTIONS_LEN; i++) {
+		// Verify that adding 1 to the current pointer will not go past the end of the packet.
+		if (tcp_options_cur_ptr + 1 > (__u8 *)tcp_opt_end_ptr || tcp_options_cur_ptr + 1 > (__u8 *)data_end) {
+			return -1;
 		}
-
-		// Option > 1, should have option size
-		if (pos + 2 > opt_end || pos + 2 > data_end)
-			return -1;
-		opt_size = *(pos + 1);
-		if (opt_size < 2) // Stop parsing options if opt_size has an invalid value
-			return -1;
-
-		// Option-kind is TCP timestap (yey!)
-		if (opt == 8 && opt_size == 10) {
-			if (pos + 10 > opt_end || pos + 10 > data_end)
+		// Dereference the pointer to get the option kind.
+		opt_kind = *tcp_options_cur_ptr;
+		// switch case to check the option kind.
+		switch (opt_kind) {
+			case 0:
+				// End of options list.
 				return -1;
-			*tsval = bpf_ntohl(*(__u32 *)(pos + 2));
-			*tsecr = bpf_ntohl(*(__u32 *)(pos + 6));
-			return 0;
-		}
+			case 1:
+				// No operation.
+				tcp_options_cur_ptr++;
+				continue;
+			default:
+				// Some kind of option.
+				// Since each option is at least 2 bytes long, we need to check that adding 2 to the pointer will not go past the end of the packet.
+				if (tcp_options_cur_ptr + 2 > tcp_opt_end_ptr || tcp_options_cur_ptr + 2 > (__u8 *)data_end) {
+					return -1;
+				}
+				// Get the length of the option.
+				opt_len = *(tcp_options_cur_ptr + 1);
+				// Check that the option length is valid. It should be at least 2 bytes long.
+				if (opt_len < 2) {
+					return -1;
+				}
+				// Check if the option is the timestamp option. The timestamp option has a kind of 8 and a length of 10 bytes.
+				if (opt_kind == 8 && opt_len == 10) {
+					// Verify that adding the option's length to the pointer will not go past the end of the packet.
+					if (tcp_options_cur_ptr + 10 > tcp_opt_end_ptr || tcp_options_cur_ptr + 10 > (__u8 *)data_end) {
+						return -1;
+					}
+					// Found the TSval and TSecr values. Store them in the tsval and tsecr pointers.
+					*tsval = bpf_ntohl(*(__u32 *)(tcp_options_cur_ptr + 2));
+					*tsecr = bpf_ntohl(*(__u32 *)(tcp_options_cur_ptr + 6));
 
-		// Some other TCP option - advance option-length bytes
-		pos += opt_size;
+					return 0;
+				}
+				// Move the pointer to the next option.
+				tcp_options_cur_ptr += opt_len;
+		}
 	}
 	return -1;
 }
 
 // Function to parse the packet and send it to the perf buffer.
-static void parse(struct __sk_buff *skb, direction d)
+static void parse(struct __sk_buff *skb, __u8 obs)
 {
 	struct packet p;
 	__builtin_memset(&p, 0, sizeof(p));
 
 	// Get current time in nanoseconds.
-	p.ts = bpf_ktime_get_ns();
+	p.t_nsec = bpf_ktime_get_boot_ns();
 	
-	p.dir = d;
+	p.observation_point = obs;
 	p.bytes = skb->len;
 
 	void *data_end = (void *)(unsigned long long)skb->data_end;
@@ -147,6 +191,7 @@ static void parse(struct __sk_buff *skb, direction d)
 		}
 	#endif
 	#endif
+
 	// Get source and destination ports.
 	if (ip->protocol == IPPROTO_TCP)
 	{
@@ -157,19 +202,16 @@ static void parse(struct __sk_buff *skb, direction d)
 		p.src_port = tcp->source;
 		p.dst_port = tcp->dest;
 
+
 		// Get TCP metadata.
 		struct tcpmetadata tcp_metadata;
 		__builtin_memset(&tcp_metadata, 0, sizeof(tcp_metadata));
 
+		// Get all TCP flags.
+		p.flags = (tcp->fin << 0) | (tcp->syn << 1) | (tcp->rst << 2) | (tcp->psh << 3) | (tcp->ack << 4) | (tcp->urg << 5) | (tcp->ece << 6) | (tcp->cwr << 7);
+
 		tcp_metadata.seq = tcp->seq;
 		tcp_metadata.ack_num = tcp->ack_seq;
-		tcp_metadata.syn = tcp->syn;
-		tcp_metadata.ack = tcp->ack;
-		tcp_metadata.fin = tcp->fin;
-		tcp_metadata.rst = tcp->rst;
-		tcp_metadata.psh = tcp->psh;
-		tcp_metadata.urg = tcp->urg;
-
 		p.tcp_metadata = tcp_metadata;
 
 		// Get TSval/TSecr from TCP header.
@@ -186,13 +228,57 @@ static void parse(struct __sk_buff *skb, direction d)
 
 		p.src_port = udp->source;
 		p.dst_port = udp->dest;
+
+		p.flags = 1;
 	}
 	else
 	{
 		return;
 	}
 
-	bpf_perf_event_output(skb, &packetparser_events, BPF_F_CURRENT_CPU, &p, sizeof(p));
+	#ifdef ENABLE_CONNTRACK_METRICS
+		// Initialize conntrack metadata in packet struct.
+		struct conntrackmetadata conntrack_metadata;
+		__builtin_memset(&conntrack_metadata, 0, sizeof(conntrack_metadata));
+		p.conntrack_metadata = conntrack_metadata;
+	#endif // ENABLE_CONNTRACK_METRICS
+
+    #ifdef DATA_AGGREGATION_LEVEL
+
+	// Calculate sampling
+	bool sampled __attribute__((unused));
+	sampled = true;
+	
+	#ifdef DATA_SAMPLING_RATE
+	    u32 rand __attribute__((unused));
+		rand = bpf_get_prandom_u32();
+		if (rand >= UINT32_MAX / DATA_SAMPLING_RATE) {
+			sampled = false;
+		}
+	#endif
+	
+	// Process the packet in ct
+	struct packetreport report __attribute__((unused));
+	report = ct_process_packet(&p, obs, sampled);
+
+	// If the data aggregation level is low, always send the packet to the perf buffer.
+	#if DATA_AGGREGATION_LEVEL == DATA_AGGREGATION_LEVEL_LOW
+		p.previously_observed_packets = 0;
+		p.previously_observed_bytes = 0;
+		__builtin_memset(&p.previously_observed_flags, 0, sizeof(struct tcpflagscount));
+		submit_packetparser_event(skb, &p);
+		return;
+	// If the data aggregation level is high, only send the packet to the perf buffer if it needs to be reported.
+	#elif DATA_AGGREGATION_LEVEL == DATA_AGGREGATION_LEVEL_HIGH
+		if (report.report) {
+			p.previously_observed_packets = report.previously_observed_packets;
+			p.previously_observed_bytes = report.previously_observed_bytes;
+			p.previously_observed_flags = report.previously_observed_flags;
+			submit_packetparser_event(skb, &p);
+		}
+	#endif
+	#endif
+	return;
 }
 
 SEC("classifier_endpoint_ingress")
@@ -200,9 +286,9 @@ int endpoint_ingress_filter(struct __sk_buff *skb)
 {
 	// This is attached to the interface on the host side.
 	// So ingress on host is egress on endpoint and vice versa.
-	parse(skb, FROM_ENDPOINT);
-	// Always return 0 to allow packet to pass.
-	return 0;
+	parse(skb, OBSERVATION_POINT_FROM_ENDPOINT);
+	// Always return TC_ACT_UNSPEC to allow packet to pass to the next BPF program.
+	return TC_ACT_UNSPEC;
 }
 
 SEC("classifier_endpoint_egress")
@@ -210,23 +296,23 @@ int endpoint_egress_filter(struct __sk_buff *skb)
 {
 	// This is attached to the interface on the host side.
 	// So egress on host is ingress on endpoint and vice versa.
-	parse(skb, TO_ENDPOINT);
-	// Always return 0 to allow packet to pass.
-	return 0;
+	parse(skb, OBSERVATION_POINT_TO_ENDPOINT);
+	// Always return TC_ACT_UNSPEC to allow packet to pass to the next BPF program.
+	return TC_ACT_UNSPEC;
 }
 
 SEC("classifier_host_ingress")
 int host_ingress_filter(struct __sk_buff *skb)
 {
-	parse(skb, FROM_NETWORK);
-	// Always return 0 to allow packet to pass.
-	return 0;
+	parse(skb, OBSERVATION_POINT_FROM_NETWORK);
+	// Always return TC_ACT_UNSPEC to allow packet to pass to the next BPF program.
+	return TC_ACT_UNSPEC;
 }
 
 SEC("classifier_host_egress")
 int host_egress_filter(struct __sk_buff *skb)
 {
-	parse(skb, TO_NETWORK);
-	// Always return 0 to allow packet to pass.
-	return 0;
+	parse(skb, OBSERVATION_POINT_TO_NETWORK);
+	// Always return TC_ACT_UNSPEC to allow packet to pass to the next BPF program.
+	return TC_ACT_UNSPEC;
 }

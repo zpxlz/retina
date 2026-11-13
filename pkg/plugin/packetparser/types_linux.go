@@ -4,43 +4,68 @@
 package packetparser
 
 import (
+	"context"
 	"sync"
 
 	kcfg "github.com/microsoft/retina/pkg/config"
 
 	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
 	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/perf"
+	"github.com/cilium/ebpf/link"
 	tc "github.com/florianl/go-tc"
+	nl "github.com/mdlayher/netlink"
+	"github.com/vishvananda/netlink"
+
 	"github.com/microsoft/retina/pkg/enricher"
 	"github.com/microsoft/retina/pkg/log"
-	"github.com/microsoft/retina/pkg/plugin/api"
-	"github.com/vishvananda/netlink"
 )
 
 const (
-	Name                  api.PluginName = "packetparser"
-	toEndpoint            string         = "toEndpoint"
-	fromEndpoint          string         = "fromEndpoint"
-	Veth                  string         = "veth"
-	Device                string         = "device"
-	Eth0                  string         = "eth0"
-	workers               int            = 2
-	buffer                int            = 10000
-	bpfSourceDir          string         = "_cprog"
-	bpfSourceFileName     string         = "packetparser.c"
-	bpfObjectFileName     string         = "packetparser_bpf.o"
-	dynamicHeaderFileName string         = "dynamic.h"
+	TCPFlagFIN = 1 << iota
+	TCPFlagSYN
+	TCPFlagRST
+	TCPFlagPSH
+	TCPFlagACK
+	TCPFlagURG
+	TCPFlagECE
+	TCPFlagCWR
+	TCPFlagNS
+)
+
+const (
+	name                  string = "packetparser"
+	toEndpoint            string = "toEndpoint"
+	fromEndpoint          string = "fromEndpoint"
+	workers               int    = 2
+	buffer                int    = 10000
+	bpfSourceDir          string = "_cprog"
+	bpfSourceFileName     string = "packetparser.c"
+	bpfObjectFileName     string = "packetparser_bpf.o"
+	dynamicHeaderFileName string = "dynamic.h"
+	tcFilterPriority      uint16 = 0x1
+)
+
+type interfaceType string
+
+const (
+	Veth   interfaceType = "veth"
+	Device interfaceType = "device"
+)
+
+const (
+	ringBufMinKernelMajor = 5
+	ringBufMinKernelMinor = 8
+	ringBufMinKernelPatch = 0
 )
 
 var (
-	getQdisc = func(tcnl ITc) IQdisc {
+	getQdisc = func(tcnl nltc) qdisc {
 		return tcnl.Qdisc()
 	}
-	getFilter = func(tcnl ITc) IFilter {
+	getFilter = func(tcnl nltc) filter {
 		return tcnl.Filter()
 	}
-	tcOpen = func(config *tc.Config) (ITc, error) {
+	tcOpen = func(config *tc.Config) (nltc, error) {
 		return tc.Open(config)
 	}
 	getFD = func(e *ebpf.Program) int {
@@ -51,39 +76,63 @@ var (
 	perCPUBuffer = 32
 )
 
-type key struct {
+// attachmentKey uniquely identifies a network interface for BPF program attachment.
+type attachmentKey struct {
 	name         string
 	hardwareAddr string
 	netNs        int
 }
 
-//go:generate go run github.com/golang/mock/mockgen@v1.6.0 -source=types_linux.go -destination=mocks/mock_types.go -package=mocks
+// attachmentType represents the method used to attach BPF programs.
+type attachmentType int
 
-// Define the interfaces.
-type IQdisc interface {
+const (
+	attachmentTypeTC  attachmentType = iota // Traditional TC with clsact qdisc
+	attachmentTypeTCX                       // TCX (TC eXpress) - kernel 6.6+
+)
+
+// attachmentValue stores the attachment details for a network interface.
+type attachmentValue struct {
+	// TC-specific fields
+	tc    nltc
+	qdisc *tc.Object
+	// TCX-specific fields
+	attachmentType attachmentType
+	tcxIngressLink link.Link
+	tcxEgressLink  link.Link
+}
+
+//go:generate go run go.uber.org/mock/mockgen@v0.4.0 -source=types_linux.go -destination=mocks/mock_types_linux.go -package=mocks -exclude_interfaces=perfReader
+
+// tc qdisc interface
+type qdisc interface {
 	Add(info *tc.Object) error
 	Delete(info *tc.Object) error
 }
 
-type IFilter interface {
+// tc filter interface
+type filter interface {
 	Add(info *tc.Object) error
 }
 
-type ITc interface {
+// netlink tc interface
+type nltc interface {
 	Qdisc() *tc.Qdisc
 	Filter() *tc.Filter
+	SetOption(nl.ConnOption, bool) error
 	Close() error
 }
 
-type IPerf interface {
-	Read() (perf.Record, error)
+type perfReader interface {
+	Read() (perfRecord, error)
 	Close() error
 }
 
-type val struct {
-	tcnl         ITc
-	tcIngressObj *tc.Object
-	tcEgressObj  *tc.Object
+type perfRecord struct {
+	CPU         int
+	LostSamples uint64
+	RawSample   []byte
+	Remaining   int
 }
 
 type packetParser struct {
@@ -91,10 +140,10 @@ type packetParser struct {
 	l          *log.ZapLogger
 	callbackID string
 	objs       *packetparserObjects //nolint:typecheck
-	// tcMap is a map of key to *val.
-	tcMap    *sync.Map
-	reader   IPerf
-	enricher enricher.EnricherInterface
+	// attachmentMap is a map of interface key to attachment details (TC or TCX).
+	attachmentMap *sync.Map
+	reader        perfReader
+	enricher      enricher.EnricherInterface
 	// interfaceLockMap is a map of key to *sync.Mutex.
 	interfaceLockMap    *sync.Map
 	endpointIngressInfo *ebpf.ProgramInfo
@@ -102,23 +151,19 @@ type packetParser struct {
 	hostIngressInfo     *ebpf.ProgramInfo
 	hostEgressInfo      *ebpf.ProgramInfo
 	wg                  sync.WaitGroup
-	recordsChannel      chan perf.Record
-	externalChannel     chan *v1.Event
+	recordsChannel      chan perfRecord
+	// stopReporter cancels reportLostEvents and reporterWg waits for it to exit. Stop uses
+	// both before closing objs, since the reporter reads a map from objs.
+	stopReporter    context.CancelFunc
+	reporterWg      sync.WaitGroup
+	externalChannel chan *v1.Event
+	tcxSupported    bool // Whether TCX is supported on this system
 }
 
-func ifaceToKey(iface netlink.LinkAttrs) key {
-	return key{
+func ifaceToKey(iface netlink.LinkAttrs) attachmentKey {
+	return attachmentKey{
 		name:         iface.Name,
 		hardwareAddr: iface.HardwareAddr.String(),
 		netNs:        iface.NetNsID,
 	}
-}
-
-const (
-	handleMajMask uint32 = 0xFFFF0000
-	handleMinMask uint32 = 0x0000FFFF
-)
-
-func TC_H_MAKE(maj, min uint32) uint32 {
-	return (((maj) & handleMajMask) | (min & handleMinMask))
 }

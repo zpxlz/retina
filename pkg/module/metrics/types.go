@@ -36,13 +36,16 @@ const (
 	portCtxOption = "port"
 
 	// workloads context option
-	workloadKindCtxOption = "workloadKind"
+	workloadKindCtxOption = "workload_kind"
 
 	// workload context option
-	workloadNameCtxOption = "workloadName"
+	workloadNameCtxOption = "workload_name"
 
 	// workload context option
 	workloadCtxOption = "workload"
+
+	// zone context option
+	zoneCtxOption = "zone"
 
 	// localContext means only the pods on this node will be watched
 	// and only these events will be enriched
@@ -59,7 +62,7 @@ const (
 	egress = "egress"
 )
 
-//go:generate go run github.com/golang/mock/mockgen@v1.6.0 -source=types.go -destination=mock_types.go -package=metrics
+//go:generate go run go.uber.org/mock/mockgen@v0.4.0 -source=types.go -destination=mock_types.go -package=metrics
 type IModule interface {
 	Reconcile(spec *api.MetricsSpec) error
 }
@@ -95,6 +98,7 @@ type ContextOptions struct {
 	Workload  bool
 	Service   bool
 	Port      bool
+	Zone      bool
 }
 
 type DirtyCachePod struct {
@@ -129,6 +133,8 @@ func NewCtxOption(opts []string, option ctxOptionType) *ContextOptions {
 			c.Service = true
 		case portCtxOption:
 			c.Port = true
+		case zoneCtxOption:
+			c.Zone = true
 		}
 	}
 
@@ -168,6 +174,10 @@ func (c *ContextOptions) getLabels() []string {
 
 	if c.Port {
 		labels = append(labels, prefix+portCtxOption)
+	}
+
+	if c.Zone {
+		labels = append(labels, prefix+zoneCtxOption)
 	}
 
 	return labels
@@ -304,9 +314,20 @@ func (c *ContextOptions) getByDirectionValues(f *flow.Flow, dest bool) []string 
 				} else {
 					values = append(values, fmt.Sprintf("%d", udp.GetSourcePort()))
 				}
+			} else {
+				// Non-TCP/UDP L4 (e.g. ICMP) has no port; keep values aligned with labels.
+				values = append(values, "unknown")
 			}
 		} else {
 			values = append(values, "unknown")
+		}
+	}
+
+	if c.Zone {
+		if !dest {
+			values = append(values, utils.SourceZone(f))
+		} else {
+			values = append(values, utils.DestinationZone(f))
 		}
 	}
 
@@ -336,19 +357,19 @@ func DefaultCtxOptions() []string {
 func DefaultMetrics() []string {
 	return []string{
 		// forward
-		utils.ForwardCountTotalName,
-		utils.ForwardBytesTotalName,
+		utils.ForwardPacketsGaugeName,
+		utils.ForwardBytesGaugeName,
 		// drop
-		utils.DropCountTotalName,
-		utils.DropBytesTotalName,
+		utils.DroppedPacketsGaugeName,
+		utils.DropBytesGaugeName,
 		// tcp flags
-		utils.TcpFlagCounters,
+		utils.TCPFlagGauge,
 		// tcp retransmissions
-		utils.TcpRetransCount,
+		utils.TCPRetransCount,
 		// latency
-		utils.NodeApiServerLatencyName,
-		utils.NodeApiServerTcpHandshakeLatencyName,
-		utils.NoResponseFromApiServerName,
+		utils.NodeAPIServerLatencyName,
+		utils.NodeAPIServerTCPHandshakeLatencyName,
+		utils.NoResponseFromAPIServerName,
 		// dns
 		utils.DNSRequestCounterName,
 		utils.DNSResponseCounterName,

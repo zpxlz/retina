@@ -7,18 +7,18 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+
+	"github.com/microsoft/retina/internal/buildinfo"
 )
 
-// This variable is used by the "version" command and is set during build.
-var Version = "undefined"
+var version = &cobra.Command{
+	Use:   "version",
+	Short: "Show version",
+	Run: func(*cobra.Command, []string) {
+		fmt.Println(buildinfo.Version)
+	},
+}
 
-func VersionCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "version",
-		Short: "Show version",
-		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Println(Version)
-		},
-	}
-	return cmd
+func init() {
+	Retina.AddCommand(version)
 }

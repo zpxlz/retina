@@ -1,4 +1,5 @@
-FROM mcr.microsoft.com/oss/go/microsoft/golang:1.21 as gogen-tools
+# skopeo inspect docker://mcr.microsoft.com/oss/go/microsoft/golang:1.26-azurelinux3.0 --format "{{.Name}}@{{.Digest}}"
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/oss/go/microsoft/golang:1.26-azurelinux3.0@sha256:ed6bde29ab1d8e2ee55cacb3bff7f8f073bb74d4529833c4fee77d647cdeaeda
 
 # Default linux/architecture.
 ARG GOOS=linux
@@ -23,4 +24,4 @@ RUN ln -s /usr/bin/clang-14 /usr/bin/clang
 WORKDIR /app
 
 # Generate go code.
-ENTRYPOINT mkdir /tmp/.cache && export GOCACHE=/tmp/.cache && CGO_ENABLED=0 go generate ./...
+ENTRYPOINT mkdir /tmp/.cache && export GOCACHE=/tmp/.cache && go generate ./...

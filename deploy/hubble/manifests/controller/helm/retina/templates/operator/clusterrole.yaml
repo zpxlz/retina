@@ -1,0 +1,58 @@
+{{- if .Values.operator.enabled -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  creationTimestamp: null
+  name: retina-operator-clusterrole
+rules:
+  - apiGroups:
+      - "apiextensions.k8s.io"
+    resources:
+      - "customresourcedefinitions"
+    verbs:
+      - "create"
+  - apiGroups:
+      - "apiextensions.k8s.io"
+    resources:
+      - "customresourcedefinitions"
+    resourceNames:
+      - ciliumidentities.cilium.io
+      - ciliumendpoints.cilium.io
+    verbs:
+      - "get"
+      - "update"
+      - "delete"
+      - "patch"
+  - apiGroups:
+    - ""
+    resources:
+      - pods
+      - namespaces
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+    - cilium.io
+    resources:
+    - ciliumidentities
+    - ciliumendpoints
+    verbs:
+    - create
+    - delete
+    - get
+    - list
+    - patch
+    - update
+    - watch
+  # for endpointgc
+  # will not create ciliumnode objects
+  - apiGroups:
+    - cilium.io
+    resources:
+    - ciliumnodes
+    verbs:
+    - get
+    - list
+    - watch
+{{- end -}}

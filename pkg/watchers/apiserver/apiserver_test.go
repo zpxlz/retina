@@ -12,21 +12,32 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
+	kcfg "github.com/microsoft/retina/pkg/config"
 	"github.com/microsoft/retina/pkg/log"
 	filtermanagermocks "github.com/microsoft/retina/pkg/managers/filtermanager"
 	"github.com/microsoft/retina/pkg/watchers/apiserver/mocks"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+var errDNS = errors.New("DNS error")
 
 func TestGetWatcher(t *testing.T) {
 	log.SetupZapLogger(log.GetDefaultLogOpts())
 
-	a := Watcher()
+	a := Watcher(kcfg.DefaultFilterMapMaxEntries)
 	assert.NotNil(t, a)
 
-	a_again := Watcher()
-	assert.Equal(t, a, a_again, "Expected the same veth watcher instance")
+	aAgain := Watcher(kcfg.DefaultFilterMapMaxEntries)
+	assert.Equal(t, a, aAgain, "Expected the same veth watcher instance")
 }
 
 func TestAPIServerWatcherStop(t *testing.T) {
@@ -42,7 +53,8 @@ func TestAPIServerWatcherStop(t *testing.T) {
 	a := &ApiServerWatcher{
 		isRunning:     false,
 		l:             log.Logger().Named("apiserver-watcher"),
-		filtermanager: mockedFilterManager,
+		filterManager: mockedFilterManager,
+		restConfig:    getMockConfig(true),
 	}
 	err := a.Stop(ctx)
 	assert.NoError(t, err, "Expected no error when stopping a stopped apiserver watcher")
@@ -71,9 +83,9 @@ func TestRefresh(t *testing.T) {
 
 	a := &ApiServerWatcher{
 		l:             log.Logger().Named("apiserver-watcher"),
-		apiServerUrl:  "https://kubernetes.default.svc.cluster.local:443",
 		hostResolver:  mockedResolver,
-		filtermanager: mockedFilterManager,
+		filterManager: mockedFilterManager,
+		client:        getMockKubeClient(),
 	}
 
 	// Return 2 random IPs for the host everytime LookupHost is called.
@@ -105,7 +117,6 @@ func TestDiffCache(t *testing.T) {
 
 	a := &ApiServerWatcher{
 		l:            log.Logger().Named("apiserver-watcher"),
-		apiServerUrl: "https://kubernetes.default.svc.cluster.local:443",
 		hostResolver: mockedResolver,
 		current:      old,
 		new:          new,
@@ -116,7 +127,7 @@ func TestDiffCache(t *testing.T) {
 	assert.Equal(t, 1, len(deleted), "Expected 1 deleted host")
 }
 
-func TestRefreshError(t *testing.T) {
+func TestRefreshLookUpAlwaysFail(t *testing.T) {
 	log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -128,17 +139,17 @@ func TestRefreshError(t *testing.T) {
 
 	a := &ApiServerWatcher{
 		l:            log.Logger().Named("apiserver-watcher"),
-		apiServerUrl: "https://kubernetes.default.svc.cluster.local:443",
 		hostResolver: mockedResolver,
+		client:       getMockKubeClient(),
 	}
 
 	mockedResolver.EXPECT().LookupHost(gomock.Any(), gomock.Any()).Return(nil, errors.New("Error")).AnyTimes()
 
 	a.Refresh(ctx)
-	assert.Error(t, a.Refresh(context.Background()), "Expected error when refreshing the cache")
+	require.Error(t, a.Refresh(context.Background()), "Expected error when refreshing the cache")
 }
 
-func TestResolveIPEmpty(t *testing.T) {
+func TestInitWithIncorrectURL(t *testing.T) {
 	log.SetupZapLogger(log.GetDefaultLogOpts())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -147,19 +158,92 @@ func TestResolveIPEmpty(t *testing.T) {
 	defer cancel()
 
 	mockedResolver := mocks.NewMockIHostResolver(ctrl)
+	mockedFilterManager := filtermanagermocks.NewMockIFilterManager(ctrl)
 
 	a := &ApiServerWatcher{
-		l:            log.Logger().Named("apiserver-watcher"),
-		apiServerUrl: "https://kubernetes.default.svc.cluster.local:443",
-		hostResolver: mockedResolver,
+		l:             log.Logger().Named("apiserver-watcher"),
+		hostResolver:  mockedResolver,
+		restConfig:    getMockConfig(false),
+		client:        getMockKubeClient(),
+		filterManager: mockedFilterManager,
 	}
 
 	mockedResolver.EXPECT().LookupHost(gomock.Any(), gomock.Any()).Return([]string{}, nil).AnyTimes()
-
-	a.Refresh(ctx)
-	assert.Error(t, a.Refresh(context.Background()), "Expected error when refreshing the cache")
+	require.Error(t, a.Init(ctx), "Expected error during init")
 }
 
 func randomIP() string {
 	return fmt.Sprintf("%d.%d.%d.%d", rand.Intn(256), rand.Intn(256), rand.Intn(256), rand.Intn(256))
+}
+
+// Mock function to simulate getting a Kubernetes config
+func getMockConfig(isCorrect bool) *rest.Config {
+	if isCorrect {
+		return &rest.Config{
+			Host: "https://kubernetes.default.svc.cluster.local:443",
+		}
+	}
+	return &rest.Config{
+		Host: "",
+	}
+}
+
+func getMockKubeClient() client.Client {
+	kubernetesSvc := corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubernetes",
+			Namespace: "default",
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIPs: []string{"172.0.16.1"},
+		},
+	}
+
+	slice := discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubernetes",
+			Namespace: "default",
+			Labels: map[string]string{
+				discoveryv1.LabelServiceName: "kubernetes",
+			},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints: []discoveryv1.Endpoint{
+			{Addresses: []string{"100.64.83.200"}},
+			{Addresses: []string{"100.64.83.201"}},
+		},
+	}
+	return fake.NewFakeClient(&slice, &kubernetesSvc)
+}
+
+func TestRefreshFailsFirstFourAttemptsSucceedsOnFifth(t *testing.T) {
+	_, err := log.SetupZapLogger(log.GetDefaultLogOpts())
+	require.NoError(t, err)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	mockedResolver := mocks.NewMockIHostResolver(ctrl)
+	mockedFilterManager := filtermanagermocks.NewMockIFilterManager(ctrl)
+
+	a := &ApiServerWatcher{
+		l:             log.Logger().Named("apiserver-watcher"),
+		hostResolver:  mockedResolver,
+		filterManager: mockedFilterManager,
+		client:        getMockKubeClient(),
+	}
+
+	// Simulate LookupHost failing the first four times and succeeding on the fifth.
+	gomock.InOrder(
+		mockedResolver.EXPECT().LookupHost(gomock.Any(), gomock.Any()).Return(nil, errDNS).Times(4),
+		mockedResolver.EXPECT().LookupHost(gomock.Any(), gomock.Any()).Return([]string{"127.0.0.1"}, nil).Times(1),
+	)
+
+	mockedFilterManager.EXPECT().AddIPs(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	mockedFilterManager.EXPECT().DeleteIPs(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+
+	err = a.Refresh(ctx)
+	require.NoError(t, err, "Expected no error when refreshing the cache")
 }

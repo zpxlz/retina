@@ -4,6 +4,7 @@
 package metrics
 
 import (
+	"log/slog"
 	"testing"
 
 	"github.com/microsoft/retina/pkg/log"
@@ -12,10 +13,10 @@ import (
 func TestInitialization_FirstInit(t *testing.T) {
 	log.SetupZapLogger(log.GetDefaultLogOpts())
 
-	InitializeMetrics()
+	InitializeMetrics(slog.Default())
 
 	//  All metrics should be initialized.
-	objs := []interface{}{DropCounter, DropBytesCounter, ForwardBytesCounter, ForwardCounter, NodeConnectivityStatusGauge, NodeConnectivityLatencyGauge, PluginManagerFailedToReconcileCounter}
+	objs := []interface{}{DropPacketsGauge, DropBytesGauge, ForwardBytesGauge, ForwardPacketsGauge, NodeConnectivityStatusGauge, NodeConnectivityLatencyGauge, PluginManagerFailedToReconcileCounter}
 	for _, obj := range objs {
 		if obj == nil {
 			t.Fatalf("Expected all metrics to be initialized")
@@ -31,7 +32,7 @@ func TestInitialization_MultipleInit(t *testing.T) {
 	}()
 	log.SetupZapLogger(log.GetDefaultLogOpts())
 
-	InitializeMetrics()
+	InitializeMetrics(slog.Default())
 	// Should not panic when reinitializing.
-	InitializeMetrics()
+	InitializeMetrics(slog.Default())
 }

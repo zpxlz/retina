@@ -7,35 +7,37 @@ package packetforward
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"path"
 	"runtime"
 	"syscall"
 	"time"
 
-	kcfg "github.com/microsoft/retina/pkg/config"
-
 	hubblev1 "github.com/cilium/cilium/pkg/hubble/api/v1"
 	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/rlimit"
+	kcfg "github.com/microsoft/retina/pkg/config"
 	"github.com/microsoft/retina/pkg/loader"
 	"github.com/microsoft/retina/pkg/log"
 	"github.com/microsoft/retina/pkg/metrics"
-	"github.com/microsoft/retina/pkg/plugin/api"
 	"github.com/microsoft/retina/pkg/utils"
+	"github.com/pkg/errors"
 	"go.uber.org/zap"
 
 	_ "github.com/microsoft/retina/pkg/plugin/packetforward/_cprog" // nolint
+	"github.com/microsoft/retina/pkg/plugin/registry"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go@master -cc clang-14 -cflags "-g -O2 -Wall -D__TARGET_ARCH_${GOARCH} -Wall" -target ${GOARCH} -type metric packetforward ./_cprog/packetforward.c -- -I../lib/_${GOARCH} -I../lib/common/libbpf/_src
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go@master -cflags "-g -O2 -Wall -D__TARGET_ARCH_${GOARCH} -Wall" -target ${GOARCH} -type metric packetforward ./_cprog/packetforward.c -- -I../lib/_${GOARCH} -I../lib/common/libbpf/_src
+
+func init() {
+	registry.Add(name, New)
+}
 
 // New creates a new packetforward plugin.
-func New(cfg *kcfg.Config) api.Plugin {
+func New(cfg *kcfg.Config) registry.Plugin {
 	return &packetForward{
 		cfg: cfg,
-		l:   log.Logger().Named(string(Name)),
+		l:   log.Logger().Named(name),
 	}
 }
 
@@ -81,22 +83,22 @@ func processMapValue(m IMap, key uint32) (uint64, uint64, error) {
 
 func updateMetrics(data *PacketForwardData) {
 	// Add the packet count metrics.
-	metrics.ForwardCounter.WithLabelValues(ingressLabel).Set(float64(data.ingressCountTotal))
-	metrics.ForwardCounter.WithLabelValues(egressLabel).Set(float64(data.egressCountTotal))
+	metrics.ForwardPacketsGauge.WithLabelValues(ingressLabel).Set(float64(data.ingressCountTotal))
+	metrics.ForwardPacketsGauge.WithLabelValues(egressLabel).Set(float64(data.egressCountTotal))
 
 	// Add the packet bytes metrics.
-	metrics.ForwardBytesCounter.WithLabelValues(ingressLabel).Set(float64(data.ingressBytesTotal))
-	metrics.ForwardBytesCounter.WithLabelValues(egressLabel).Set(float64(data.egressBytesTotal))
+	metrics.ForwardBytesGauge.WithLabelValues(ingressLabel).Set(float64(data.ingressBytesTotal))
+	metrics.ForwardBytesGauge.WithLabelValues(egressLabel).Set(float64(data.egressBytesTotal))
 }
 
 // Plugin API implementation for packet forward.
-// Ref: github.com/microsoft/retina/pkg/plugin/api
+// Ref: github.com/microsoft/retina/pkg/plugin
 
 func (p *packetForward) Name() string {
-	return string(Name)
+	return name
 }
 
-func (p *packetForward) Generate(ctx context.Context) error {
+func (p *packetForward) Generate(context.Context) error {
 	// Use this function to parse p and generate header files under cprog.
 	// Example: https://github.com/anubhabMajumdar/Retina/blob/c4bc06e7f922124f92536ffb5312bada5c2dfe99/pkg/plugin/custom/packetforward/packetforward.go#L77
 	p.l.Info("Packet forwarding metric header generated")
@@ -122,21 +124,23 @@ func (p *packetForward) Compile(ctx context.Context) error {
 	if arch == "arm64" {
 		targetArch = "-D__TARGET_ARCH_arm64"
 	}
+
+	runtimeIncludeDir := "-I" + loader.VmlinuxHeaderDir()
+
 	// Keep target as bpf, otherwise clang compilation yields bpf object that elf reader cannot load.
-	err = loader.CompileEbpf(ctx, "-target", "bpf", "-Wall", targetArch, "-g", "-O2", "-c", bpfSourceFile, "-o", bpfOutputFile, includeDir, libbpfDir)
+	err = loader.CompileEbpf(
+		ctx,
+		"-target", "bpf", "-Wall", targetArch, "-g", "-O2", "-c", bpfSourceFile,
+		"-o", bpfOutputFile, runtimeIncludeDir, includeDir, libbpfDir,
+	)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "error compiling ebpf code")
 	}
 	p.l.Info("Packet forwarding metric compiled")
 	return nil
 }
 
 func (p *packetForward) Init() error {
-	if err := rlimit.RemoveMemlock(); err != nil {
-		p.l.Error("RemoveMemLock failed:%w", zap.Error(err))
-		return err
-	}
-
 	// Get the absolute path to this file during runtime.
 	dir, err := absPath()
 	if err != nil {
@@ -157,7 +161,7 @@ func (p *packetForward) Init() error {
 		return err
 	}
 
-	p.hashmapData = objs.Packets
+	p.hashmapData = objs.RetinaPacketforwardMetrics
 
 	// The steps to attach ebpf to socket is documented in cilium/ebpf
 	// https://github.com/cilium/ebpf/blob/master/example_sock_elf_test.go#L85.
@@ -198,8 +202,8 @@ func (p *packetForward) Stop() error {
 	return nil
 }
 
-func (p *packetForward) SetupChannel(ch chan *hubblev1.Event) error {
-	p.l.Warn("SetupChannel is not supported by plugin", zap.String("plugin", string(Name)))
+func (p *packetForward) SetupChannel(chan *hubblev1.Event) error {
+	p.l.Debug("SetupChannel is not supported by plugin", zap.String("plugin", name))
 	return nil
 }
 

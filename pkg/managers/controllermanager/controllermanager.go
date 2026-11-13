@@ -4,18 +4,16 @@ package controllermanager
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	kcfg "github.com/microsoft/retina/pkg/config"
 	"github.com/microsoft/retina/pkg/controllers/cache"
 	"github.com/microsoft/retina/pkg/enricher"
-	"github.com/microsoft/retina/pkg/log"
 	pm "github.com/microsoft/retina/pkg/managers/pluginmanager"
 	sm "github.com/microsoft/retina/pkg/managers/servermanager"
-	"github.com/microsoft/retina/pkg/plugin/api"
 	"github.com/microsoft/retina/pkg/pubsub"
 	"github.com/microsoft/retina/pkg/telemetry"
-	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
@@ -27,7 +25,7 @@ const (
 )
 
 type Controller struct {
-	l             *log.ZapLogger
+	l             *slog.Logger
 	httpServer    *sm.HTTPServer
 	pluginManager *pm.PluginManager
 	tel           telemetry.Telemetry
@@ -37,8 +35,10 @@ type Controller struct {
 	enricher      *enricher.Enricher
 }
 
-func NewControllerManager(conf *kcfg.Config, kubeclient kubernetes.Interface, tel telemetry.Telemetry) (*Controller, error) {
-	cmLogger := log.Logger().Named("controller-manager")
+func NewControllerManager(
+	conf *kcfg.Config, kubeclient kubernetes.Interface, tel telemetry.Telemetry, logger *slog.Logger,
+) (*Controller, error) {
+	cmLogger := logger.With("module", "controller-manager")
 
 	if conf.EnablePodLevel {
 		// informer factory for pods/services
@@ -46,15 +46,10 @@ func NewControllerManager(conf *kcfg.Config, kubeclient kubernetes.Interface, te
 		factory.WaitForCacheSync(wait.NeverStop)
 	}
 
-	// enabledPlugins := {api.PluginName(conf.EnabledPlugin[])}
-	enabledPlugins := []api.PluginName{}
-	for _, pluginName := range conf.EnabledPlugin {
-		enabledPlugins = append(enabledPlugins, api.PluginName(pluginName))
-	}
 	pMgr, err := pm.NewPluginManager(
 		conf,
 		tel,
-		enabledPlugins...,
+		logger,
 	)
 	if err != nil {
 		return nil, err
@@ -62,8 +57,8 @@ func NewControllerManager(conf *kcfg.Config, kubeclient kubernetes.Interface, te
 
 	// create HTTP server for API server
 	httpServer := sm.NewHTTPServer(
-		conf.ApiServer.Host,
-		conf.ApiServer.Port,
+		conf.APIServer.Host,
+		conf.APIServer.Port,
 	)
 
 	return &Controller{
@@ -116,7 +111,12 @@ func (m *Controller) Start(ctx context.Context) {
 	// })
 
 	if err := g.Wait(); err != nil {
-		m.l.Panic("Error running controller manager", zap.Error(err))
+		m.l.Error("Error running controller manager", "error", err)
+		// Flush the slog handler before panicking so the error message is not lost
+		if h, ok := m.l.Handler().(interface{ Flush() error }); ok {
+			_ = h.Flush()
+		}
+		panic(err)
 	}
 }
 

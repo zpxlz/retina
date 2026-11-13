@@ -5,58 +5,68 @@
 package dropreason
 
 import (
+	"bytes"
 	"context"
-	"errors"
+	"encoding/binary"
 	"fmt"
-	"os"
 	"path"
 	"runtime"
 	"time"
-	"unsafe"
-
-	kcfg "github.com/microsoft/retina/pkg/config"
-	"github.com/microsoft/retina/pkg/utils"
 
 	"github.com/cilium/cilium/api/v1/flow"
 	hubblev1 "github.com/cilium/cilium/pkg/hubble/api/v1"
 	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
-	"github.com/cilium/ebpf/rlimit"
+	"github.com/microsoft/retina/internal/ktime"
+	kcfg "github.com/microsoft/retina/pkg/config"
 	"github.com/microsoft/retina/pkg/enricher"
 	"github.com/microsoft/retina/pkg/loader"
 	"github.com/microsoft/retina/pkg/log"
 	"github.com/microsoft/retina/pkg/metrics"
-	"github.com/microsoft/retina/pkg/plugin/api"
 	plugincommon "github.com/microsoft/retina/pkg/plugin/common"
-	"go.uber.org/zap"
-
 	_ "github.com/microsoft/retina/pkg/plugin/dropreason/_cprog" // nolint
+	"github.com/microsoft/retina/pkg/plugin/registry"
+	"github.com/microsoft/retina/pkg/utils"
+	"github.com/pkg/errors"
+	"go.uber.org/zap"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go@master -cc clang-14 -cflags "-g -O2 -Wall -D__TARGET_ARCH_${GOARCH} -Wall" -target ${GOARCH} -type metrics_map_value -type drop_reason_t -type packet kprobe ./_cprog/drop_reason.c -- -I../lib/_${GOARCH} -I../lib/common/libbpf/_src -I../filter/_cprog/
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go@master -cflags "-g -O2 -Wall -D__TARGET_ARCH_${GOARCH} -Wall" -target ${GOARCH} -type metrics_map_value -type drop_reason_t -type packet kprobe ./_cprog/drop_reason.c -- -I../lib/_${GOARCH} -I../lib/common/libbpf/_src -I../filter/_cprog/
 const (
-	nfHookSlowFn         = "nf_hook_slow"
-	tcpConnectFn         = "tcp_v4_connect"
-	intCskAcceptFn       = "inet_csk_accept"
-	nfNatInetFn          = "nf_nat_inet_fn"
-	nfConntrackConfirmFn = "__nf_conntrack_confirm"
+	nfHookSlowFn              = "nf_hook_slow"
+	nfHookSlowFnRet           = "nf_hook_slow_ret"
+	nfHookSlowFnFexit         = "nf_hook_slow_fexit"
+	tcpConnectFn              = "tcp_v4_connect"
+	tcpV4ConnectFexit         = "tcp_v4_connect_fexit"
+	inetCskAcceptFn           = "inet_csk_accept"
+	inetCskAcceptFnRet        = "inet_csk_accept_ret"
+	inetCskAcceptFnFexit      = "inet_csk_accept_fexit"
+	nfNatInetFn               = "nf_nat_inet_fn"
+	nfNatInetFnRet            = "nf_nat_inet_fn_ret"
+	nfNatInetFnFexit          = "nf_nat_inet_fn_fexit"
+	nfConntrackConfirmFn      = "__nf_conntrack_confirm"
+	nfConntrackConfirmFnRet   = "__nf_conntrack_confirm_ret"
+	nfConntrackConfirmFnFexit = "__nf_conntrack_confirm_fexit"
 )
+
+func init() {
+	registry.Add(name, New)
+}
 
 // New creates a new dropreason plugin.
 // When opts.EnablePodLevel=false, the enricher will not be used.
-func New(cfg *kcfg.Config) api.Plugin {
+func New(cfg *kcfg.Config) registry.Plugin {
 	return &dropReason{
 		cfg: cfg,
-		l:   log.Logger().Named(string(Name)),
+		l:   log.Logger().Named(name),
 	}
 }
 
 // Plugin API implementation for packet forward.
-// Ref: github.com/microsoft/retina/pkg/plugin/api
+// Ref: github.com/microsoft/retina/pkg/plugin
 
 func (dr *dropReason) Name() string {
-	return string(Name)
+	return name
 }
 
 func (dr *dropReason) Generate(ctx context.Context) error {
@@ -96,11 +106,6 @@ func (dr *dropReason) Compile(ctx context.Context) error {
 		return err
 	}
 
-	// Generate dynamic header file.
-	if err := dr.Generate(ctx); err != nil {
-		dr.l.Error("failed to generate DropReason dynamic header:%w", zap.Error(err))
-	}
-
 	bpfSourceFile := fmt.Sprintf("%s/%s/%s", dir, bpfSourceDir, bpfSourceFileName)
 	bpfOutputFile := fmt.Sprintf("%s/%s", dir, bpfObjectFileName)
 
@@ -112,23 +117,23 @@ func (dr *dropReason) Compile(ctx context.Context) error {
 	if arch == "arm64" {
 		targetArch = "-D__TARGET_ARCH_arm64"
 	}
+
+	runtimeIncludeDir := "-I" + loader.VmlinuxHeaderDir()
+
 	// Keep target as bpf, otherwise clang compilation yields bpf object that elf reader cannot load.
-	err = loader.CompileEbpf(ctx, "-target", "bpf", "-Wall", targetArch, "-g", "-O2", "-c", bpfSourceFile, "-o", bpfOutputFile, includeDir, libbpfDir, filterDir)
+	err = loader.CompileEbpf(
+		ctx,
+		"-target", "bpf", "-Wall", targetArch, "-g", "-O2", "-c", bpfSourceFile,
+		"-o", bpfOutputFile, runtimeIncludeDir, includeDir, libbpfDir, filterDir,
+	)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "unable to compile eBPF code")
 	}
 	dr.l.Info("DropReason metric compiled")
 	return nil
 }
 
 func (dr *dropReason) Init() error {
-	var err error
-
-	if err = rlimit.RemoveMemlock(); err != nil {
-		dr.l.Error("RemoveMemLock failed:%w", zap.Error(err))
-		return err
-	}
-
 	// Get the absolute path to this file during runtime.
 	dir, err := absPath()
 	if err != nil {
@@ -136,11 +141,19 @@ func (dr *dropReason) Init() error {
 	}
 
 	bpfOutputFile := fmt.Sprintf("%s/%s", dir, bpfObjectFileName)
-
-	objs := &kprobeObjects{} //nolint:typecheck
 	spec, err := ebpf.LoadCollectionSpec(bpfOutputFile)
 	if err != nil {
+		return err //nolint:wrapcheck // no additional context needed
+	}
+
+	objs, maps, supportsFexit, err := dr.getEbpfPayload()
+	if err != nil {
 		return err
+	}
+
+	// Override filter map max entries to match the configured size from init container.
+	if mapSpec, ok := spec.Maps[plugincommon.FilterMapName]; ok && dr.cfg.FilterMapMaxEntries > 0 {
+		mapSpec.MaxEntries = dr.cfg.FilterMapMaxEntries
 	}
 
 	// TODO remove the opts
@@ -149,96 +162,31 @@ func (dr *dropReason) Init() error {
 			LogLevel: 2,
 		},
 		Maps: ebpf.MapOptions{
-			PinPath: plugincommon.FilterMapPath,
+			PinPath: plugincommon.MapPath,
 		},
 	}); err != nil {
-		dr.l.Error("Error loading objects: %w", zap.Error(err))
+		dr.l.Error("Error loading eBPF programs", zap.Error(err))
 		return err
 	}
 
 	// read perf map
-	dr.reader, err = plugincommon.NewPerfReader(dr.l, objs.DropreasonEvents, perCPUBuffer, 1)
+	dr.reader, err = plugincommon.NewPerfReader(dr.l, maps.RetinaDropreasonEvents, perCPUBuffer, 1)
 	if err != nil {
-		dr.l.Error("Error NewReader: %w", zap.Error(err))
+		dr.l.Error("Error NewReader", zap.Error(err))
 		return err
 	}
 
-	dr.KNfHook, err = link.Kprobe(nfHookSlowFn, objs.NfHookSlow, nil)
-	if err != nil {
-		dr.l.Error("opening kprobe: %w", zap.Error(err))
-		return err
+	progsKprobe, progsKprobeRet := buildKprobePrograms(objs)
+	progsFexit := buildFexitPrograms(objs)
+
+	if supportsFexit {
+		err = dr.attachFexitPrograms(progsFexit)
+	} else {
+		err = dr.attachKprobes(progsKprobe, progsKprobeRet)
 	}
 
-	dr.KRetnfhook, err = link.Kretprobe(nfHookSlowFn, objs.NfHookSlowRet, nil)
-	if err != nil {
-		dr.l.Error("opening kretprobe: %w", zap.Error(err))
-		return err
-	}
-
-	dr.KRetTCPConnect, err = link.Kretprobe(tcpConnectFn, objs.TcpV4ConnectRet, nil)
-	if err != nil {
-		dr.l.Error("opening kretprobe: %w", zap.Error(err))
-		return err
-	}
-
-	dr.KTCPAccept, err = link.Kretprobe(intCskAcceptFn, objs.InetCskAccept, nil)
-	if err != nil {
-		dr.l.Error("opening kretprobe: %w", zap.Error(err))
-		return err
-	}
-
-	dr.KRetTCPAccept, err = link.Kretprobe(intCskAcceptFn, objs.InetCskAcceptRet, nil)
-	if err != nil {
-		dr.l.Error("opening kretprobe: %w", zap.Error(err))
-		return err
-	}
-
-	dr.KNfNatInet, err = link.Kretprobe(nfNatInetFn, objs.NfNatInetFn, nil)
-	if err != nil {
-		// TODO: remove this check once we get this working on Mariner OS.
-		if errors.Is(err, os.ErrNotExist) {
-			dr.l.Warn("nf_nat_inet_fn not found, skipping attaching kretprobe to it. This may impact the drop reason metrics.")
-		} else {
-			dr.l.Error("opening kretprobe: %w", zap.Error(err))
-			return err
-		}
-	}
-
-	dr.KRetNfNatInet, err = link.Kretprobe(nfNatInetFn, objs.NfNatInetFnRet, nil)
-	if err != nil {
-		// TODO: remove this check once we get this working on Mariner OS.
-		if errors.Is(err, os.ErrNotExist) {
-			dr.l.Warn("nf_nat_inet_fn_ret not found, skipping attaching kretprobe to it. This may impact the drop reason metrics.")
-		} else {
-			dr.l.Error("opening kretprobe: %w", zap.Error(err))
-			return err
-		}
-	}
-
-	dr.KNfConntrackConfirm, err = link.Kprobe(nfConntrackConfirmFn, objs.NfConntrackConfirm, nil)
-	if err != nil {
-		// TODO: remove this check once we get this working on Mariner OS.
-		if errors.Is(err, os.ErrNotExist) {
-			dr.l.Warn("nf_conntrack_confirm not found, skipping attaching kprobe to it. This may impact the drop reason metrics.")
-		} else {
-			dr.l.Error("opening kprobe: %w", zap.Error(err))
-			return err
-		}
-	}
-
-	dr.KRetNfConntrackConfirm, err = link.Kretprobe(nfConntrackConfirmFn, objs.NfConntrackConfirmRet, nil)
-	if err != nil {
-		// TODO: remove this check once we get this working on Mariner OS.
-		if errors.Is(err, os.ErrNotExist) {
-			dr.l.Warn("nf_conntrack_confirm_ret not found, skipping attaching kretprobe to it. This may impact the drop reason metrics.")
-		} else {
-			dr.l.Error("opening kretprobe: %w", zap.Error(err))
-			return err
-		}
-	}
-
-	dr.metricsMapData = objs.MetricsMap
-	return nil
+	dr.metricsMapData = maps.RetinaDropreasonMetrics
+	return err
 }
 
 func (dr *dropReason) Start(ctx context.Context) error {
@@ -350,13 +298,22 @@ func (dr *dropReason) processRecord(ctx context.Context, id int) {
 			dr.l.Info("Context is done, dropreason worker will stop running", zap.Int("id", id))
 			return
 		case record := <-dr.recordsChannel:
-			bpfEvent := (*kprobePacket)(unsafe.Pointer(&record.RawSample[0])) //nolint:typecheck
+			var bpfEvent kprobePacket
+			err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &bpfEvent)
+			if err != nil {
+				if binary.Size(bpfEvent) != len(record.RawSample) {
+					dr.l.Error("Error reading bpf event due to size mismatch", zap.Error(err), zap.Int("expected", binary.Size(bpfEvent)), zap.Int("actual", len(record.RawSample)))
+				} else {
+					dr.l.Error("Error reading bpf event", zap.Error(err))
+				}
+				continue
+			}
 			sourcePortShort := uint32(utils.HostToNetShort(bpfEvent.SrcPort))
 			destinationPortShort := uint32(utils.HostToNetShort(bpfEvent.DstPort))
-			dropKey := (dropMetricKey)(bpfEvent.Key)
 
 			fl := utils.ToFlow(
-				int64(bpfEvent.Ts),
+				dr.l,
+				ktime.MonotonicOffset.Nanoseconds()+int64(bpfEvent.Ts),
 				utils.Int2ip(bpfEvent.SrcIp).To4(), // Precautionary To4() call.
 				utils.Int2ip(bpfEvent.DstIp).To4(), // Precautionary To4() call.
 				sourcePortShort,
@@ -364,23 +321,34 @@ func (dr *dropReason) processRecord(ctx context.Context, id int) {
 				bpfEvent.Proto,
 				2, // drop reason packet doesn't have a direction yet, so we set it to 2
 				flow.Verdict_DROPPED,
-				dropKey.DropType,
 			)
 			if fl == nil {
 				dr.l.Warn("Could not convert bpfEvent to flow", zap.Any("bpfEvent", bpfEvent))
 				continue
 			}
-			fl.DropReasonDesc = flow.DropReason(bpfEvent.Key.DropType)
-			utils.AddPacketSize(fl, bpfEvent.SkbLen)
+
+			// IsReply is not applicable for DROPPED verdicts.
+			fl.IsReply = nil
+
+			ext := utils.NewExtensions()
+
+			// Add drop reason to the flow's extensions.
+			utils.AddDropReason(fl, ext, bpfEvent.DropType)
+
+			// Add packet size to the flow's extensions.
+			utils.AddPacketSize(ext, bpfEvent.SkbLen)
+
+			// Set extensions on the flow.
+			utils.SetExtensions(fl, ext)
 
 			// This is only for development purposes.
 			// Removing this makes logs way too chatter-y.
-			dr.l.Debug("DropReason Packet Received", zap.Any("flow", fl), zap.Any("Raw Bpf Event", bpfEvent), zap.Uint32("drop type", bpfEvent.Key.DropType))
+			dr.l.Debug("DropReason Packet Received", zap.Any("flow", fl), zap.Any("Raw Bpf Event", bpfEvent), zap.Uint16("drop type", bpfEvent.DropType))
 
 			// Write the event to the enricher.
 			ev := &hubblev1.Event{
 				Event:     fl,
-				Timestamp: fl.Time,
+				Timestamp: fl.GetTime(),
 			}
 			if dr.enricher != nil {
 				dr.enricher.Write(ev)
@@ -391,7 +359,7 @@ func (dr *dropReason) processRecord(ctx context.Context, id int) {
 				select {
 				case dr.externalChannel <- ev:
 				default:
-					metrics.LostEventsCounter.WithLabelValues(utils.ExternalChannel, string(Name)).Inc()
+					metrics.LostEventsCounter.WithLabelValues(utils.ExternalChannel, name).Inc()
 				}
 			}
 		}
@@ -413,7 +381,7 @@ func (dr *dropReason) readEventArrayData() error {
 
 	if record.LostSamples > 0 {
 		// dr.l.Warn("Lost samples in drop reason plugin", zap.Uint64("lost samples", record.LostSamples))
-		metrics.LostEventsCounter.WithLabelValues(utils.Kernel, string(Name)).Add(float64(record.LostSamples))
+		metrics.LostEventsCounter.WithLabelValues(utils.Kernel, name).Add(float64(record.LostSamples))
 		return nil
 	}
 
@@ -422,7 +390,7 @@ func (dr *dropReason) readEventArrayData() error {
 		dr.l.Debug("Record sent to channel", zap.Any("record", record))
 	default:
 		// dr.l.Warn("Channel is full, dropping record", zap.Any("record", record))
-		metrics.LostEventsCounter.WithLabelValues(utils.BufferedChannel, string(Name)).Inc()
+		metrics.LostEventsCounter.WithLabelValues(utils.BufferedChannel, name).Inc()
 	}
 
 	return nil
@@ -432,7 +400,7 @@ func (dr *dropReason) processMapValue(dataKey dropMetricKey, dataValue dropMetri
 	pktCount, pktBytes := dataValue.getPktCountAndBytes()
 
 	dr.l.Debug("DATA From the DropReason Map", zap.String("Droptype", dataKey.getType()),
-		zap.Uint32("Return Val", dataKey.ReturnVal),
+		zap.Int32("Return Val", dataKey.ReturnVal),
 		zap.Int("DropCount", int(pktCount)),
 		zap.Int("DropBytes", int(pktBytes)))
 
@@ -443,22 +411,14 @@ func (dr *dropReason) Stop() error {
 	if !dr.isRunning {
 		return nil
 	}
+
 	dr.l.Info("Closing drop reason probes...")
-	if dr.KNfHook != nil {
-		dr.KNfHook.Close()
+	for _, hook := range dr.hooks {
+		if hook != nil {
+			hook.Close()
+		}
 	}
-	if dr.KRetnfhook != nil {
-		dr.KRetnfhook.Close()
-	}
-	if dr.KRetTCPConnect != nil {
-		dr.KRetTCPConnect.Close()
-	}
-	if dr.KRetTCPAccept != nil {
-		dr.KRetTCPAccept.Close()
-	}
-	if dr.KTCPAccept != nil {
-		dr.KTCPAccept.Close()
-	}
+
 	if dr.metricsMapData != nil {
 		dr.metricsMapData.Close()
 	}
@@ -483,8 +443,8 @@ func (dr *dropReason) Stop() error {
 }
 
 func (dr *dropReason) dropMetricAdd(reason string, direction string, count float64, bytes float64) {
-	metrics.DropCounter.WithLabelValues(reason, direction).Set(float64(count))
-	metrics.DropBytesCounter.WithLabelValues(reason, direction).Set(float64(bytes))
+	metrics.DropPacketsGauge.WithLabelValues(reason, direction).Set(float64(count))
+	metrics.DropBytesGauge.WithLabelValues(reason, direction).Set(float64(bytes))
 }
 
 // Helper functions.

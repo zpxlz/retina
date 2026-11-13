@@ -1,0 +1,35 @@
+# This dockerfile requires building natively on windows
+# It can't be placed in the other Windows Dockerfile, as those use
+# buildx targets, and this one requires legacy build.
+# Maybe one day: https://github.com/moby/buildkit/issues/616
+ARG BUILDER_IMAGE
+# skopeo inspect docker://mcr.microsoft.com/oss/go/microsoft/golang:1.26.10-1-windowsservercore-ltsc2022 --override-os windows --format "{{.Name}}@{{.Digest}}"
+FROM --platform=windows/amd64 mcr.microsoft.com/oss/go/microsoft/golang:1.27.4-1-windowsservercore-ltsc2022@sha256:74a189228d30d9d8f2b832366ca3d8ecf9981ec77147560f0dde3140034f796c AS builder
+WORKDIR C:\\retina
+COPY go.mod .
+COPY go.sum .
+RUN go mod download
+ADD . .
+ARG VERSION
+ARG APP_INSIGHTS_ID
+SHELL ["cmd", "/S", "/C"]
+ENV VERSION=$VERSION
+
+RUN git config --global --add safe.directory C:\\retina
+ENV APP_INSIGHTS_ID=$APP_INSIGHTS_ID
+RUN go build -v -o controller.exe -ldflags="-X github.com/microsoft/retina/internal/buildinfo.Version=%VERSION% -X github.com/microsoft/retina/internal/buildinfo.ApplicationInsightsID=%APP_INSIGHTS_ID%" .\controller
+RUN go build -v -o captureworkload.exe -ldflags="-X github.com/microsoft/retina/internal/buildinfo.Version=%VERSION% -X github.com/microsoft/retina/internal/buildinfo.ApplicationInsightsID=%APP_INSIGHTS_ID%" .\captureworkload
+
+FROM --platform=windows/amd64 ${BUILDER_IMAGE} as pktmon-builder
+WORKDIR C:\\retina
+
+# skopeo inspect docker://mcr.microsoft.com/windows/nanoserver:ltsc2022 --override-os windows --format "{{.Name}}@{{.Digest}}"
+FROM --platform=windows/amd64 mcr.microsoft.com/windows/nanoserver:ltsc2022@sha256:5a1c3c8308f8f5c9b67d21d2332a449d4ab8f9a6cf277f07d4aeac27ff2a0213 AS final
+ADD https://github.com/microsoft/etl2pcapng/releases/download/v1.10.0/etl2pcapng.exe /etl2pcapng.exe
+SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'Continue';"]
+COPY --from=builder C:\\retina\\windows\\kubeconfigtemplate.yaml kubeconfigtemplate.yaml
+COPY --from=builder C:\\retina\\windows\\setkubeconfigpath.ps1 setkubeconfigpath.ps1
+COPY --from=builder C:\\retina\\controller.exe controller.exe
+COPY --from=pktmon-builder C:\\pktmon\\controller-pktmon.exe controller-pktmon.exe
+COPY --from=builder C:\\retina\\captureworkload.exe captureworkload.exe
+CMD ["controller.exe"]

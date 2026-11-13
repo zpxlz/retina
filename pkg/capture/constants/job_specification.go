@@ -3,6 +3,10 @@
 
 package constants
 
+import (
+	"github.com/microsoft/retina/internal/buildinfo"
+)
+
 // Capture job specification
 const (
 	CaptureHostPathVolumeName string = "hostpath"
@@ -16,8 +20,10 @@ const (
 	CaptureContainerEntrypoint    string = "./retina/captureworkload"
 	CaptureContainerEntrypointWin string = "captureworkload.exe"
 
-	CaptureAppname       string = "capture"
-	CaptureContainername string = "capture"
+	CaptureAppname        string = "capture"
+	CaptureContainername  string = "capture"
+	DownloadAppname       string = "download"
+	DownloadContainerName string = "download"
 
 	// CaptureOutputLocationBlobUploadSecretName is the name of the secret that stores the blob upload url.
 	CaptureOutputLocationBlobUploadSecretName string = "capture-blob-upload-secret"
@@ -26,9 +32,18 @@ const (
 	// CaptureOutputLocationBlobUploadSecretKey is the key of the secret that stores the blob upload url.
 	CaptureOutputLocationBlobUploadSecretKey string = "blob-upload-url"
 
-	// CaptureWorkloadImageName defines the official capture workload image repo and image name
-	CaptureWorkloadImageName string = "ghcr.io/microsoft/retina/retina-agent"
+	// CaptureOutputLocationS3UploadSecretName is the name of the secret that stores the s3 credentials.
+	CaptureOutputLocationS3UploadSecretName string = "capture-s3-upload-secret" // #nosec G101
+	// CaptureOutputLocationS3UploadSecretPath is the path of the secret that stores the s3 credentials.
+	CaptureOutputLocationS3UploadSecretPath string = "/etc/s3-upload-secret" // #nosec G101
+	// CaptureOutputLocationS3UploadAccessKeyID is the key of the secret that stores the s3 access key id.
+	CaptureOutputLocationS3UploadAccessKeyID string = "s3-access-key-id"
+	// CaptureOutputLocationS3UploadSecretAccessKey is the key of the secret that stores the s3 secret access key.
+	CaptureOutputLocationS3UploadSecretAccessKey string = "s3-secret-access-key"
 
 	// DebugCaptureWorkloadImageName defines the capture workload image for testing and debugging
 	DebugCaptureWorkloadImageName string = "ghcr.io/microsoft/retina/retina-agent"
 )
+
+// CaptureWorkloadImageName defines the official capture workload image repo and image name
+var CaptureWorkloadImageName string = buildinfo.RetinaAgentImageName

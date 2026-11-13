@@ -1,4 +1,9 @@
-FROM mcr.microsoft.com/oss/go/microsoft/golang:1.21 AS builder
+# skopeo inspect docker://mcr.microsoft.com/oss/go/microsoft/golang:1.26-azurelinux3.0 --format "{{.Name}}@{{.Digest}}"
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/oss/go/microsoft/golang:1.26-azurelinux3.0@sha256:ed6bde29ab1d8e2ee55cacb3bff7f8f073bb74d4529833c4fee77d647cdeaeda AS builder
+
+# systemcrypto without cgo — required for arm64 cross-compile from amd64 host.
+# Becomes redundant with Go 1.27+ (auto-selected when CGO_ENABLED=0).
+ENV GOEXPERIMENT=ms_nocgo_opensslcrypto
 
 ARG VERSION
 ARG APP_INSIGHTS_ID
@@ -6,11 +11,44 @@ ARG APP_INSIGHTS_ID
 WORKDIR /workspace
 COPY . .
 
-RUN make manifests
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-X main.version="$VERSION" -X "main.applicationInsightsID"="$APP_INSIGHTS_ID"" -a -o retina-operator operator/main.go
+# Keep fixed RPM pins until the base image includes them; verify both architectures before removing.
+RUN tdnf install -y \
+	jq \
+	krb5-1.21.3-6.azl3 \
+	libxml2-2.11.5-11.azl3 \
+	pcre2-10.48-1.azl3 \
+	popt-1.19-2.azl3 \
+	util-linux-2.40.2-6.azl3 \
+	zlib-1.3.2-2.azl3
 
-FROM scratch
+# Default linux/architecture.
+ARG GOOS=linux
+ENV GOOS=${GOOS}
+
+ARG GOARCH=amd64
+ENV GOARCH=${GOARCH}
+
+# make manifests runs controller-gen, a build-time host tool that must be
+# compiled for and executed on the build host, not the target arch. Unset the
+# cross-compile env for this step so `go tool` doesn't produce an arm64 binary
+# and then fail to exec it on the amd64 builder.
+RUN env -u GOOS -u GOARCH make manifests
+RUN --mount=type=cache,target="/root/.cache/go-build" \
+	GOOS=$GOOS GOARCH=$GOARCH go build \
+	-ldflags "-X github.com/microsoft/retina/internal/buildinfo.Version="$VERSION" \
+	-X "github.com/microsoft/retina/internal/buildinfo.ApplicationInsightsID"="$APP_INSIGHTS_ID"" \
+	-a -o retina-operator operator/main.go
+
+##################### controller #######################
+# skopeo inspect docker://mcr.microsoft.com/azurelinux/distroless/minimal:3.0 --format "{{.Name}}@{{.Digest}}"
+# Final image must be $TARGETPLATFORM (default), not $BUILDPLATFORM — the
+# retina-operator binary is cross-compiled for the target arch and would fail
+# to run inside a wrong-arch base image.
+FROM mcr.microsoft.com/azurelinux/distroless/minimal:3.0.20261105@sha256:bc4d9a4e0d3317999e235cb5895dde28bf766d25533ae8e6ba311bd6d253f996
 WORKDIR /
+COPY --from=builder /lib /lib
+COPY --from=builder /usr/lib/ /usr/lib
+COPY --from=builder /etc/pki/tls/ /etc/pki/tls/
 COPY --from=builder /workspace/retina-operator .
 USER 65532:65532
 

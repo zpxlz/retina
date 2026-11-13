@@ -1,6 +1,7 @@
 enablePodLevel: true
-remoteContext: true
-logLevel: info
+enableAnnotations: true
+enabledPlugin_win: '["hnsstats"]'
+packetParserRingBuffer: "enabled"
 operator:
   enabled: true
-enabledPlugin_linux: '["dropreason","packetforward","packetparser"]'
+  enableRetinaEndpoint: true

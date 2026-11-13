@@ -8,27 +8,26 @@ import (
 	kcfg "github.com/microsoft/retina/pkg/config"
 
 	"github.com/microsoft/retina/pkg/log"
-	"github.com/microsoft/retina/pkg/plugin/api"
 )
 
 const (
-	PacketForwardSocketAttach int            = 50
-	Name                      api.PluginName = "packetforward"
-	socketIndex               int            = 0
-	ingressKey                uint32         = 0
-	egressKey                 uint32         = 1
-	ingressLabel              string         = "ingress"
-	egressLabel               string         = "egress"
-	bpfObjectFileName         string         = "packetforward_bpf.o"
-	bpfSourceDir              string         = "_cprog"
-	bpfSourceFileName         string         = "packetforward.c"
-	dynamicHeaderFileName     string         = "dynamic.h"
+	PacketForwardSocketAttach int    = 50
+	name                      string = "packetforward"
+	socketIndex               int    = 0
+	ingressKey                uint32 = 0
+	egressKey                 uint32 = 1
+	ingressLabel              string = "ingress"
+	egressLabel               string = "egress"
+	bpfObjectFileName         string = "packetforward_bpf.o"
+	bpfSourceDir              string = "_cprog"
+	bpfSourceFileName         string = "packetforward.c"
+	dynamicHeaderFileName     string = "dynamic.h"
 )
 
 // Interface to https://pkg.go.dev/github.com/cilium/ebpf#Map.
 // Added for unit tests.
 //
-//go:generate go run github.com/golang/mock/mockgen@v1.6.0 -destination=mocks/mock_types.go -package=mocks . IMap
+//go:generate go run go.uber.org/mock/mockgen@v0.4.0 -destination=mocks/mock_types.go -package=mocks . IMap
 type IMap interface {
 	Lookup(key, valueOut interface{}) error
 	Close() error

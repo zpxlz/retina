@@ -7,19 +7,25 @@ import (
 	dto "github.com/prometheus/client_model/go"
 )
 
-//go:generate go run github.com/golang/mock/mockgen@v1.6.0 -source=interfaces.go -destination=mock_types.go -package=metrics
+//go:generate go run go.uber.org/mock/mockgen@v0.4.0 -source=interfaces.go -destination=mock_types.go -package=metrics
 
-type ICounterVec interface {
+type MetricVec interface {
+	DeleteLabelValues(lvs ...string) bool
+}
+
+type CounterVec interface {
+	MetricVec
 	WithLabelValues(lvs ...string) prometheus.Counter
 	GetMetricWithLabelValues(lvs ...string) (prometheus.Counter, error)
 }
 
-type IGaugeVec interface {
+type GaugeVec interface {
+	MetricVec
 	WithLabelValues(lvs ...string) prometheus.Gauge
 	GetMetricWithLabelValues(lvs ...string) (prometheus.Gauge, error)
 }
 
-type IHistogramVec interface {
+type Histogram interface {
 	Observe(float64)
 	// Keep the Write method for testing purposes.
 	Write(*dto.Metric) error

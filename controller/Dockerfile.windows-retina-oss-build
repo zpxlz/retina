@@ -1,0 +1,27 @@
+# Only applicable for windows images
+ARG OS_VERSION=ltsc2022
+# pinned base images
+
+# skopeo inspect docker://mcr.microsoft.com/windows/servercore:ltsc2022  --override-os windows --format "{{.Name}}@{{.Digest}}"
+FROM mcr.microsoft.com/windows/servercore:ltsc2022@sha256:301d571fc0cffed67083d4cc7a10167f551212f76b3f91eb7457e89aa5a183da AS ltsc2022
+
+FROM ${OS_VERSION} AS agent-win
+ARG GOARCH=amd64 # default to amd64
+ARG GOOS=windows # default to windows
+ARG OS_VERSION=ltsc2022
+ARG REPO_PATH
+ARG BINARIES_PATH
+ENV GOARCH=${GOARCH}
+ENV GOOS=${GOOS}
+ENV OS_VERSION=${OS_VERSION}
+ENV BINARIES_PATH=${BINARIES_PATH}
+ENV REPO_PATH=${REPO_PATH}
+# CVE-2013-3900 Mitigation
+RUN reg add "HKEY_LOCAL_MACHINE\Software\Microsoft\Cryptography\Wintrust\Config" /v "EnableCertPaddingCheck" /t REG_DWORD /d "1" /f
+RUN reg add "HKEY_LOCAL_MACHINE\Software\Wow6432Node\Microsoft\Cryptography\Wintrust\Config" /v "EnableCertPaddingCheck" /t REG_DWORD /d "1" /f
+COPY ${REPO_PATH}/windows/kubeconfigtemplate.yaml kubeconfigtemplate.yaml
+COPY ${REPO_PATH}/windows/setkubeconfigpath.ps1 setkubeconfigpath.ps1
+COPY ${BINARIES_PATH}/captureworkload.exe captureworkload.exe
+COPY ${BINARIES_PATH}/controller.exe controller.exe
+ADD https://github.com/microsoft/etl2pcapng/releases/download/v1.10.0/etl2pcapng.exe /etl2pcapng.exe
+CMD ["controller.exe", "start", "--kubeconfig=.\\kubeconfig"]

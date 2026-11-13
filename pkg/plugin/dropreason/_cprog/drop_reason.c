@@ -1,3 +1,5 @@
+//go:build ignore
+
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
@@ -9,6 +11,19 @@
 #include "drop_reason.h"
 #include "dynamic.h"
 #include "retina_filter.c"
+
+// CO-RE flavor struct for Linux 6.10+ where inet_csk_accept changed signature from
+// (struct sock *sk, int flags, int *err, bool kern) to
+// (struct sock *sk, struct proto_accept_arg *arg).
+// The ___new suffix is stripped during BTF type lookup, so bpf_core_type_exists()
+// checks for 'proto_accept_arg' in the running kernel's BTF.
+// https://github.com/torvalds/linux/commit/92ef0fd55ac80dfc2e4654edfe5d1ddfa6e070fe
+struct proto_accept_arg___new {
+    int flags;
+    int err;
+    int is_empty;
+    bool kern;
+} __attribute__((preserve_access_index));
 
 char __license[] SEC("license") = "Dual MIT/GPL";
 
@@ -23,17 +38,11 @@ char __license[] SEC("license") = "Dual MIT/GPL";
 #define PACKET_HOST 0     // Incomming packets
 #define PACKET_OUTGOING 4 // Outgoing packets
 
-typedef enum
-{
-    UNKNOWN_DIRECTION = 0,
-    INGRESS_KEY,
-    EGRESS_KEY,
-} direction_type;
-
 struct metrics_map_key
 {
-    __u32 drop_type;
-    __u32 return_val;
+    __u16 drop_type;
+    __u8 padding[2];
+    __s32 return_val;
 };
 struct metrics_map_value
 {
@@ -47,21 +56,22 @@ struct packet
     __u32 dst_ip;
     __u16 src_port;
     __u16 dst_port;
+    __u32 skb_len;
+    __u32 return_val;
+    __u16 drop_type;
     __u8 proto;
-    __u64 skb_len;
-    direction_type direction;
-    struct metrics_map_key key;
-    __u64 ts; // timestamp in nanoseconds
     // in_filtermap defines if a given packet is of interest to us
     // and added to the filtermap. is this is set then dropreason
     // will send a perf event along with the usual aggregation in metricsmap
     bool in_filtermap;
+    __u64 ts; // timestamp in nanoseconds
 };
+
 struct
 {
     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
     __uint(max_entries, 16384);
-} dropreason_events SEC(".maps");
+} retina_dropreason_events SEC(".maps");
 
 // Define const variables to avoid warnings.
 const struct packet *unused __attribute__((unused));
@@ -72,7 +82,7 @@ struct
     __uint(max_entries, 16384);
     __type(key, __u32);
     __type(value, struct packet);
-} natdrop_pids SEC(".maps");
+} retina_dropreason_natdrop_pids SEC(".maps");
 
 struct
 {
@@ -80,7 +90,7 @@ struct
     __uint(max_entries, 16384);
     __type(key, __u32);
     __type(value, struct packet);
-} drop_pids SEC(".maps");
+} retina_dropreason_drop_pids SEC(".maps");
 
 struct
 {
@@ -88,7 +98,7 @@ struct
     __uint(max_entries, 16384);
     __type(key, __u32);
     __type(value, __u64);
-} accept_pids SEC(".maps");
+} retina_dropreason_accept_pids SEC(".maps");
 
 struct
 {
@@ -96,7 +106,7 @@ struct
     __uint(max_entries, 512);
     __type(key, struct metrics_map_key);
     __type(value, struct metrics_map_value);
-} metrics_map SEC(".maps");
+} retina_dropreason_metrics SEC(".maps");
 
 #define member_address(source_struct, source_member)                                                 \
     ({                                                                                               \
@@ -113,14 +123,16 @@ struct
             member_address(source_struct, source_member));     \
     } while (0)
 
+// Updates dropped packets stats - ONLY use in Retina advanced.
 void update_metrics_map(void *ctx, drop_reason_t drop_type, int ret_val, struct packet *p)
 {
     struct metrics_map_value *entry, new_entry = {};
-    struct metrics_map_key key = {
-        .drop_type = drop_type,
-        .return_val = ret_val};
+    struct metrics_map_key key;
+    __builtin_memset(&key, 0, sizeof(key));
+    key.drop_type = drop_type;
+    key.return_val = ret_val;
 
-    entry = bpf_map_lookup_elem(&metrics_map, &key);
+    entry = bpf_map_lookup_elem(&retina_dropreason_metrics, &key);
     if (entry)
     {
         entry->count += 1;
@@ -130,21 +142,42 @@ void update_metrics_map(void *ctx, drop_reason_t drop_type, int ret_val, struct 
     {
         new_entry.count = 1;
         new_entry.bytes = p->skb_len;
-        bpf_map_update_elem(&metrics_map, &key, &new_entry, 0);
+        bpf_map_update_elem(&retina_dropreason_metrics, &key, &new_entry, 0);
     }
 // parse packet if advanced metrics are enabled
 #ifdef ADVANCED_METRICS
 #if ADVANCED_METRICS == 1
     if (p->in_filtermap)
     {
-        struct metrics_map_key key2 = {
-            .drop_type = drop_type,
-            .return_val = ret_val};
-        p->key = key2;
-        bpf_perf_event_output(ctx, &dropreason_events, BPF_F_CURRENT_CPU, p, sizeof(struct packet));
+        p->drop_type = drop_type;
+        p->return_val = ret_val;
+        bpf_perf_event_output(ctx, &retina_dropreason_events, BPF_F_CURRENT_CPU, p, sizeof(struct packet));
     };
 #endif
-#endif
+#endif    
+}
+
+// Updates dropped packet count - ONLY use in Retina basic.
+void update_metrics_map_basic(drop_reason_t drop_type, int ret_val, __u32 skb_len)
+{
+    struct metrics_map_value *entry, new_entry = {};
+    struct metrics_map_key key = {
+        .drop_type = drop_type,
+        .return_val = ret_val
+    };
+
+    entry = bpf_map_lookup_elem(&retina_dropreason_metrics, &key);
+    if (entry)
+    {
+        __sync_fetch_and_add(&entry->count, 1);
+        entry->bytes += skb_len;
+    }
+    else
+    {
+        new_entry.count = 1;
+        new_entry.bytes = skb_len;
+        bpf_map_update_elem(&retina_dropreason_metrics, &key, &new_entry, 0);
+    }
 }
 
 static void get_packet_from_skb(struct packet *p, struct sk_buff *skb)
@@ -153,11 +186,11 @@ static void get_packet_from_skb(struct packet *p, struct sk_buff *skb)
     {
         return;
     }
+    
     // TODO parse direction like in packetforward
     __u64 skb_len = 0;
     member_read(&skb_len, skb, len);
     p->skb_len = skb_len;
-
 #ifdef ADVANCED_METRICS
 #if ADVANCED_METRICS == 1
     char *head;
@@ -184,7 +217,7 @@ static void get_packet_from_skb(struct packet *p, struct sk_buff *skb)
     p->src_ip = iphdr.saddr;
     p->dst_ip = iphdr.daddr;
     // get current timestamp in ns
-    p->ts = bpf_ktime_get_ns();
+    p->ts = bpf_ktime_get_boot_ns();
 
     if (iphdr.protocol == IPPROTO_TCP)
     {
@@ -229,7 +262,7 @@ static void get_packet_from_sock(struct packet *p, struct sock *sk)
 	#endif
 
     // get current timestamp in ns
-    p->ts = bpf_ktime_get_ns();
+    p->ts = bpf_ktime_get_boot_ns();
     p->in_filtermap = true;
     p->src_ip = saddr;
     p->dst_ip = daddr;
@@ -238,9 +271,7 @@ static void get_packet_from_sock(struct packet *p, struct sock *sk)
 }
 
 /*
-
-This function will be saving the PID and length of skb it is working on.
-
+    This function will be saving the PID and length of skb it is working on.
 */
 
 SEC("kprobe/nf_hook_slow")
@@ -257,53 +288,59 @@ int BPF_KPROBE(nf_hook_slow, struct sk_buff *skb, struct nf_hook_state *state)
 
     struct packet p;
     __builtin_memset(&p, 0, sizeof(p));
-
-    p.in_filtermap = false;
-    p.skb_len = 0;
     get_packet_from_skb(&p, skb);
 
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
-    bpf_map_update_elem(&drop_pids, &pid, &p, BPF_ANY);
+    bpf_map_update_elem(&retina_dropreason_drop_pids, &pid, &p, BPF_ANY);
     return 0;
 }
 
 /*
-This function will look PID and the length of SKB it is working on. Then it checks
-the return value of the function and update the metrics map accordingly.
-
+    This function will look PID and the length of SKB it is working on. Then it checks
+    the return value of the function and update the metrics map accordingly.
 */
-
 SEC("kretprobe/nf_hook_slow")
 int BPF_KRETPROBE(nf_hook_slow_ret, int retVal)
 {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
-    struct packet *p = bpf_map_lookup_elem(&drop_pids, &pid);
-    bpf_map_delete_elem(&drop_pids, &pid);
 
+    if (retVal >= 0)
+    {
+        bpf_map_delete_elem(&retina_dropreason_drop_pids, &pid);
+        return 0;
+    }
+
+    struct packet *p = bpf_map_lookup_elem(&retina_dropreason_drop_pids, &pid);
     if (!p)
     {
         return 0;
     }
 
-    if (retVal >= 0)
-    {
-        return 0;
-    }
+    bpf_map_delete_elem(&retina_dropreason_drop_pids, &pid);
 
-    update_metrics_map(ctx, IPTABLE_RULE_DROP, 0, p);
+    update_metrics_map(ctx, IPTABLE_RULE_DROP, retVal, p);
     return 0;
 }
 
-// static __always_inline int
-// exit_tcp_connect(struct pt_regs *ctx, int ret)
+SEC("fexit/nf_hook_slow")
+int BPF_PROG(nf_hook_slow_fexit, struct sk_buff *skb, struct nf_hook_state *state,
+    const struct nf_hook_entries *e, unsigned int s, int retVal)
+{
+    if (retVal < 0) {
+        __u32 skb_len = 0;
+        member_read(&skb_len, skb, len);
+        update_metrics_map_basic(IPTABLE_RULE_DROP, retVal, skb_len);
+    }
+
+    return 0;
+}
 
 /*
-This function checks the return value of tcp_v4_connect and
- update the metrics map accordingly.
-
- tcp_v4_connect does not have any lenth attached to it.
+    This function checks the return value of tcp_v4_connect and
+    update the metrics map accordingly.
+    tcp_v4_connect does not have any length attached to it.
 */
 
 SEC("kretprobe/tcp_v4_connect")
@@ -317,15 +354,24 @@ int BPF_KRETPROBE(tcp_v4_connect_ret, int retVal)
     struct packet p;
     __builtin_memset(&p, 0, sizeof(p));
 
-    p.in_filtermap = false;
-    p.skb_len = 0;
-
     update_metrics_map(ctx, TCP_CONNECT_BASIC, retVal, &p);
     return 0;
 }
 
+SEC("fexit/tcp_v4_connect")
+int BPF_PROG(tcp_v4_connect_fexit, struct sock *sk, struct sockaddr *uaddr, int addr_len, int retVal)
+{
+    if (retVal == 0)
+    {
+        return 0;
+    }
+
+    update_metrics_map_basic(TCP_CONNECT_BASIC, retVal, 0);
+    return 0;
+}
+
 SEC("kprobe/inet_csk_accept")
-int BPF_KPROBE(inet_csk_accept, struct sock *sk, int flags, int *err, bool kern)
+int BPF_KPROBE(inet_csk_accept)
 {
     /*
     This function will save the reference value to error.
@@ -333,8 +379,21 @@ int BPF_KPROBE(inet_csk_accept, struct sock *sk, int flags, int *err, bool kern)
     */
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
-    __u64 err_ptr = (__u64)err;
-    bpf_map_update_elem(&accept_pids, &pid, &err_ptr, BPF_ANY);
+
+    __u64 err_ptr = 0;
+
+    // Linux 6.10+: inet_csk_accept(struct sock *sk, struct proto_accept_arg *arg)
+    // err is an inline int field inside proto_accept_arg.
+    if (bpf_core_type_exists(struct proto_accept_arg___new)) {
+        struct proto_accept_arg___new *arg = (struct proto_accept_arg___new *)PT_REGS_PARM2(ctx);
+        err_ptr = (__u64)&arg->err;
+    } else {
+        // Pre-6.10: inet_csk_accept(struct sock *sk, int flags, int *err, bool kern)
+        int *err = (int *)PT_REGS_PARM3(ctx);
+        err_ptr = (__u64)err;
+    }
+
+    bpf_map_update_elem(&retina_dropreason_accept_pids, &pid, &err_ptr, BPF_ANY);
     return 0;
 }
 
@@ -352,8 +411,8 @@ int BPF_KRETPROBE(inet_csk_accept_ret, struct sock *sk)
     */
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
-    __u64 *err_ptr = bpf_map_lookup_elem(&accept_pids, &pid);
-    bpf_map_delete_elem(&accept_pids, &pid);
+    __u64 *err_ptr = bpf_map_lookup_elem(&retina_dropreason_accept_pids, &pid);
+    bpf_map_delete_elem(&retina_dropreason_accept_pids, &pid);
 
     if (!err_ptr)
         return 0;
@@ -361,7 +420,11 @@ int BPF_KRETPROBE(inet_csk_accept_ret, struct sock *sk)
     if (sk != NULL)
         return 0;
 
-    int err = (int)*err_ptr;
+    // *err_ptr holds the ADDRESS of the callee's errno output (the int *err
+    // parameter pre-6.10, &arg->err on 6.10+); the errno must be read through it.
+    int err = 0;
+    if (bpf_probe_read_kernel(&err, sizeof(err), (void *)(unsigned long)*err_ptr) < 0)
+        return 0;
     if (err >= 0)
         return 0;
 
@@ -381,6 +444,27 @@ int BPF_KRETPROBE(inet_csk_accept_ret, struct sock *sk)
     return 0;
 }
 
+SEC("fexit/inet_csk_accept")
+int BPF_PROG(inet_csk_accept_fexit)
+{
+    // Each branch must be fully self-contained so the compiler generates a real
+    // branch instruction. If merged into a select, the verifier rejects the
+    // variable-offset ctx access ("dereference of modified ctx ptr").
+    //
+    // fexit ctx layout: [param1, param2, ..., paramN, return_value]
+    // Linux 6.10+: 2 params (sk, arg) -> retsk at ctx[2]
+    // Pre-6.10:    4 params (sk, flags, err, kern) -> retsk at ctx[4]
+    if (bpf_core_type_exists(struct proto_accept_arg___new)) {
+        if ((struct sock *)ctx[2] == NULL)
+            update_metrics_map_basic(TCP_ACCEPT_BASIC, 0, 0);
+    } else {
+        if ((struct sock *)ctx[4] == NULL)
+            update_metrics_map_basic(TCP_ACCEPT_BASIC, 0, 0);
+    }
+
+    return 0;
+}
+
 SEC("kprobe/nf_nat_inet_fn")
 int BPF_KPROBE(nf_nat_inet_fn, void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
 {
@@ -395,14 +479,11 @@ int BPF_KPROBE(nf_nat_inet_fn, void *priv, struct sk_buff *skb, const struct nf_
 
     struct packet p;
     __builtin_memset(&p, 0, sizeof(p));
-
-    p.in_filtermap = false;
-    p.skb_len = 0;
     get_packet_from_skb(&p, skb);
 
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
-    bpf_map_update_elem(&natdrop_pids, &pid, &p, BPF_ANY);
+    bpf_map_update_elem(&retina_dropreason_natdrop_pids, &pid, &p, BPF_ANY);
     return 0;
 }
 
@@ -411,18 +492,37 @@ int BPF_KRETPROBE(nf_nat_inet_fn_ret, int retVal)
 {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
-    struct packet *p = bpf_map_lookup_elem(&natdrop_pids, &pid);
-    bpf_map_delete_elem(&natdrop_pids, &pid);
-
-    if (!p)
-        return 0;
 
     if (retVal != NF_DROP)
+    {
+        bpf_map_delete_elem(&retina_dropreason_natdrop_pids, &pid);
+        return 0;
+    }
+
+    struct packet *p = bpf_map_lookup_elem(&retina_dropreason_natdrop_pids, &pid);
+    if (!p)
     {
         return 0;
     }
 
-    update_metrics_map(ctx, IPTABLE_NAT_DROP, 0, p);
+    bpf_map_delete_elem(&retina_dropreason_natdrop_pids, &pid);
+
+    update_metrics_map(ctx, IPTABLE_NAT_DROP, retVal, p);
+    return 0;
+}
+
+SEC("fexit/nf_nat_inet_fn")
+int BPF_PROG(nf_nat_inet_fn_fexit, void *priv, struct sk_buff *skb, const struct nf_hook_state *state, int retVal)
+{
+    if (retVal != NF_DROP)
+    {
+        return 0;
+    }
+    
+    __u32 skb_len = 0;
+    member_read(&skb_len, skb, len);
+
+    update_metrics_map_basic(IPTABLE_NAT_DROP, retVal, skb_len);
     return 0;
 }
 
@@ -440,14 +540,11 @@ int BPF_KPROBE(nf_conntrack_confirm, struct sk_buff *skb)
 
     struct packet p;
     __builtin_memset(&p, 0, sizeof(p));
-
-    p.in_filtermap = false;
-    p.skb_len = 0;
     get_packet_from_skb(&p, skb);
 
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
-    bpf_map_update_elem(&natdrop_pids, &pid, &p, BPF_ANY);
+    bpf_map_update_elem(&retina_dropreason_natdrop_pids, &pid, &p, BPF_ANY);
     return 0;
 }
 
@@ -456,17 +553,36 @@ int BPF_KRETPROBE(nf_conntrack_confirm_ret, int retVal)
 {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
-    struct packet *p = bpf_map_lookup_elem(&natdrop_pids, &pid);
-    bpf_map_delete_elem(&natdrop_pids, &pid);
-
-    if (!p)
+    
+    if (retVal != NF_DROP)
+    {
+        bpf_map_delete_elem(&retina_dropreason_natdrop_pids, &pid);
         return 0;
+    }
+    
+    struct packet *p = bpf_map_lookup_elem(&retina_dropreason_natdrop_pids, &pid);
+    if (!p)
+    {
+        return 0;
+    }
 
+    bpf_map_delete_elem(&retina_dropreason_natdrop_pids, &pid);
+
+    update_metrics_map(ctx, CONNTRACK_ADD_DROP, retVal, p);
+    return 0;
+}
+
+SEC("fexit/__nf_conntrack_confirm")
+int BPF_PROG(nf_conntrack_confirm_fexit, struct sk_buff *skb, int retVal)
+{
     if (retVal != NF_DROP)
     {
         return 0;
     }
 
-    update_metrics_map(ctx, CONNTRACK_ADD_DROP, retVal, p);
+    __u32 skb_len = 0;
+    member_read(&skb_len, skb, len);
+
+    update_metrics_map_basic(CONNTRACK_ADD_DROP, retVal, skb_len);
     return 0;
 }

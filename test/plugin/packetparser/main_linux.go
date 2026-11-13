@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"time"
 
@@ -14,7 +15,6 @@ import (
 	"github.com/microsoft/retina/pkg/log"
 	"github.com/microsoft/retina/pkg/managers/filtermanager"
 	"github.com/microsoft/retina/pkg/managers/watchermanager"
-	"github.com/microsoft/retina/pkg/plugin/api"
 	"github.com/microsoft/retina/pkg/plugin/packetparser"
 	"github.com/microsoft/retina/pkg/watchers/endpoint"
 	"go.uber.org/zap"
@@ -22,38 +22,18 @@ import (
 	"github.com/microsoft/retina/pkg/metrics"
 )
 
-var tt api.Plugin
-
-// func test(l *log.ZapLogger) {
-// 	m := &dto.Metric{}
-// 	metrics.NodeApiServerTcpHandshakeLatencyMs.Write(m)
-
-// 	h := m.Histogram.GetBucket()
-// 	var last uint64
-// 	last = 0
-// 	for _, b := range h {
-// 		l.Info("Hist", zap.Any("Bucket", b.UpperBound), zap.Any("Count", *b.CumulativeCount-last))
-// 		last = *b.CumulativeCount
-// 	}
-// }
-
 func main() {
 	opts := log.GetDefaultLogOpts()
 	opts.Level = "debug"
 	log.SetupZapLogger(opts)
 	l := log.Logger().Named("test-packetparser")
 
-	metrics.InitializeMetrics()
-
-	// test(l)
-	// return
-
-	metrics.InitializeMetrics()
+	metrics.InitializeMetrics(slog.Default())
 
 	ctxTimeout, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
 	// watcher manager
-	wm := watchermanager.NewWatcherManager()
+	wm := watchermanager.NewWatcherManager(kcfg.DefaultFilterMapMaxEntries)
 	wm.Watchers = []watchermanager.IWatcher{endpoint.Watcher()}
 
 	err := wm.Start(ctxTimeout)
@@ -67,7 +47,7 @@ func main() {
 		}
 	}()
 	// Filtermanager.
-	f, err := filtermanager.Init(3)
+	f, err := filtermanager.Init(3, kcfg.DefaultFilterMapMaxEntries)
 	if err != nil {
 		l.Error("Start filtermanager failed", zap.Error(err))
 		return
@@ -78,9 +58,6 @@ func main() {
 		}
 	}()
 
-	// Add IPs to filtermanager.
-	// ipsToAdd := []string{"10.224.0.106", "10.224.0.101"}
-	// ipsToAdd := []string{"20.69.116.85", "10.224.0.6"}
 	ipsToAdd := []string{"20.69.116.85"}
 	ips := []net.IP{}
 	for _, ip := range ipsToAdd {
@@ -96,41 +73,37 @@ func main() {
 		return
 	}
 
-	// time.Sleep(30 * time.Second)
-	// f.DeleteIPs(ips, "packetparser-test")
-	// return
-
 	// Start packetparser plugin.
 	cfg := &kcfg.Config{
 		MetricsInterval: 1 * time.Second,
 		EnablePodLevel:  true,
 	}
-	tt = packetparser.New(cfg)
-	if err = tt.Stop(); err != nil {
+	p := packetparser.New(cfg)
+	if err = p.Stop(); err != nil {
 		l.Error("Stop packetparser plugin failed", zap.Error(err))
 		return
 	}
 
 	defer cancel()
-	err = tt.Generate(ctxTimeout)
+	err = p.Generate(ctxTimeout)
 	if err != nil {
 		l.Error("Generate failed", zap.Error(err))
 		return
 	}
 
-	err = tt.Compile(ctxTimeout)
+	err = p.Compile(ctxTimeout)
 	if err != nil {
 		l.Error("Compile failed", zap.Error(err))
 		return
 	}
 
-	err = tt.Init()
+	err = p.Init()
 	if err != nil {
 		l.Error("Init failed", zap.Error(err))
 		return
 	}
 
-	err = tt.Start(ctxTimeout)
+	err = p.Start(ctxTimeout)
 	if err != nil {
 		l.Error("Start failed", zap.Error(err))
 		return
@@ -142,8 +115,10 @@ func main() {
 		time.Sleep(1 * time.Second)
 	}
 
-	tt.Stop()
+	err = p.Stop()
+	if err != nil {
+		l.Error("Stop failed", zap.Error(err))
+		return
+	}
 	l.Info("Stopping packetparser")
-
-	// test(l)
 }

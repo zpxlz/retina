@@ -1,10 +1,15 @@
-# Retina
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset="site/static/img/Retina-logo-horizontal.png">
+    <img src="site/static/img/Retina-logo-horizontal.png" alt="Retina Logo" width="30%">
+  </picture>
+</h1>
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://github.com/codespaces/new?hide_repo_select=true&ref=main&repo=746962176)
 
 [![goreport][goreport-img]][goreport] ![GitHub release][release-img] [![retina-publish][godoc-badge]][godoc] ![license]
 
-[![retina-test][retina-test-image-badge]][retina-test-image] [![retinash][retinash-badge]][retinash] [![retina-publish][retina-publish-badge]][retina-publish] ![retina-codeql-img][retina-codeql-badge] ![retina-golangci-lint-img][retina-golangci-lint-badge]
+[![retina-test][retina-test-image-badge]][retina-test-image] [![retinash][retinash-badge]][retinash] ![retina-codeql-img][retina-codeql-badge] ![retina-golangci-lint-img][retina-golangci-lint-badge]
 
 ## Overview
 
@@ -22,78 +27,112 @@ Retina **collects customizable telemetry**, which can be exported to **multiple 
 
 ## Why Retina?
 
-Retina lets you **investigate network issues on-demand** and **continuously monitor your clusters**. For scenarios where Retina shines, see the intro docs [here](https://retina.sh/docs/intro)
+Retina lets you **investigate network issues on-demand** and **continuously monitor your clusters**. For scenarios where Retina shines, see the intro docs [here](https://retina.sh/docs/Introduction/intro)
 
 ## Documentation
 
 See [retina.sh](http://retina.sh) for documentation and examples.
 
+## Known Limitations
+
+⚠️ **Performance on High-Core-Count Systems**: Community users have reported performance considerations when using Advanced metrics (with `packetparser` plugin) on nodes with 32+ CPU cores under high network load. Consider starting with Basic metrics mode on large node types. See [Known Limitations](https://retina.sh/docs/Introduction/intro#known-limitations) for details.
+
+⚠️ **Windows Server 2019**: Retina no longer supports Windows Server 2019 nodes. Use Windows Server 2022 for Windows workloads.
+
 ## Capabilities
 
 Retina has two major features:
 
-- [Metrics](https://retina.sh/docs/metrics/modes)
-- [Captures](https://retina.sh/docs/captures)
+- [Metrics](https://retina.sh/docs/Metrics/metrics-intro)
+- [Captures](https://retina.sh/docs/Captures/overview)
 
 ### Metrics Quick Install Guide
 
-Prerequisites: Go, Helm
+Retina can be installed using the Helm chart from GHCR:
 
-1. Clone the repo, then install Retina on your Kubernetes cluster
+```bash
+# Set the version to a specific version here or get latest version from GitHub API.
+VERSION=$( curl -sL https://api.github.com/repos/microsoft/retina/releases/latest | jq -r .name)
+helm upgrade --install retina oci://ghcr.io/microsoft/retina/charts/retina \
+    --version $VERSION \
+    --set image.tag=$VERSION \
+    --set operator.tag=$VERSION \
+    --set logLevel=info \
+    --set enabledPlugin_linux="\[dropreason\,packetforward\,linuxutil\,dns\]"
+```
 
-    ```bash
-    make helm-install
-    ```
+Set the `version` and image `tag` arguments to the desired version, if different.
 
-2. Follow steps in [Using Prometheus and Grafana](https://retina.sh/docs/installation/prometheus-unmanaged) to set up metrics collection and visualization.
+After Helm install, follow the steps for setting up [Prometheus](https://retina.sh/docs/Installation/prometheus) and [Grafana](https://retina.sh/docs/Installation/grafana) to configure metrics collection and visualization.
 
 ### Captures Quick Start Guide
 
 #### Captures via CLI
 
-Currently, Retina CLI only supports Linux.
+The preferred way to install the Retina CLI using [Krew](https://krew.sigs.k8s.io/).
 
-- Option 1: Download from Release
-
-  Download `kubectl-retina` from the latest [Retina release](https://github.com/microsoft/retina/releases).
-  Feel free to move the binary to `/usr/local/bin/`, or add it to your `PATH` otherwise.
-
-- Option 2: Build from source
-
-  Requirements:
-
-  - go 1.21 or newer
-  - GNU make
-
-  Clone the Retina repo and execute:
-
-  ```shell
-  make install-kubectl-retina
-  ```
-
-Execute Retina:
-
-```shell
-kubectl-retina capture create --help
+```bash
+kubectl krew install retina
 ```
 
-For further CLI documentation, see [Capture with Retina CLI](../captures/cli.md).
+Other installation options are documented in [CLI Installation](https://retina.sh/docs/Installation/CLI).
+
+Verify installation:
+
+```bash
+$ kubectl retina
+Retina is an eBPF distributed networking observability tool for Kubernetes.
+
+Usage:
+  kubectl-retina [command]
+
+Available Commands:
+  capture     Capture network traffic
+  completion  Generate the autocompletion script for the specified shell
+  config      Configure retina CLI
+  help        Help about any command
+  shell       [EXPERIMENTAL] Interactively debug a node or pod
+  trace       Retrieve status or results from Retina
+  version     Show version
+
+Flags:
+  -h, --help   help for kubectl-retina
+
+Use "kubectl-retina [command] --help" for more information about a command.
+```
+
+To quickly start creating a capture:
+
+```bash
+kubectl retina capture create --pod-selectors <app=my-app>
+```
+
+For further CLI documentation, see [Capture with Retina CLI](https://retina.sh/docs/Captures/cli).
 
 #### Captures via CRD
 
-Prerequisites: Go, Helm
+Install Retina using Helm:
 
-1. Clone the repo, then install Retina with Capture operator support on your Kubernetes cluster
+```bash
+VERSION=$( curl -sL https://api.github.com/repos/microsoft/retina/releases/latest | jq -r .name)
+helm upgrade --install retina oci://ghcr.io/microsoft/retina/charts/retina \
+    --version $VERSION \
+    --set image.tag=$VERSION \
+    --set operator.tag=$VERSION \
+    --set image.pullPolicy=Always \
+    --set logLevel=info \
+    --set os.windows=true \
+    --set operator.enabled=true \
+    --set operator.enableRetinaEndpoint=true \
+    --skip-crds \
+    --set enabledPlugin_linux="\[dropreason\,packetforward\,linuxutil\,dns\,packetparser\]"
+```
 
-    ```bash
-    make helm-install-with-operator
-    ```
-
-2. Follow steps in [Capture CRD](https://retina.sh/docs/captures/#option-2-capture-crd-custom-resource-definition) for documentation of the CRD and examples for setting up Captures.
+Then follow steps in [Capture CRD](https://retina.sh/docs/Captures/overview/#option-2-capture-crd-custom-resource-definition) for documentation of the CRD and examples for setting up Captures.
 
 ## Contributing
 
-This project welcomes contributions and suggestions.  Most contributions require you to agree to a
+This project welcomes contributions and suggestions. Most contributions require you to agree to a
 Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us
 the rights to use your contribution. For details, visit <https://cla.opensource.microsoft.com>.
 
@@ -105,11 +144,23 @@ This project has adopted the [Microsoft Open Source Code of Conduct](https://ope
 For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or
 contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
 
-[Read more about how to begin contributing here.](https://retina.sh/docs/contributing)
+[Read more about how to begin contributing here.](https://retina.sh/docs/Contributing/overview)
+
+### Verify signed images
+
+Retina images published to GHCR are cryptographically signed. You can verify their provenance with [`sigstore/cosign`](https://github.com/sigstore/cosign):
+
+```shell
+REPO=microsoft/retina # or your repo
+IMAGE=retina-operator # or other image to verify
+# This can be replaced with another tag to verify, or with the image SHA256
+LATEST_TAG=$(curl -s https://api.github.com/repos/microsoft/retina/releases | jq -r '.[0].name')
+cosign verify ghcr.io/$REPO/$IMAGE:$LATEST_TAG --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity-regexp="https://github.com/$REPO" -o text
+```
 
 ### Office Hours and Community Meetings
 
-We host a periodic open community meeting. [Find the details here.](https://retina.sh/docs/contributing/#office-hours-and-community-meetings)
+We host a periodic open community meeting. [Find the details here.](https://retina.sh/docs/Contributing/overview#office-hours-and-community-meetings)
 
 ## Trademarks
 
@@ -128,9 +179,9 @@ This project has adopted the [Microsoft Open Source Code of Conduct](https://ope
 
 ## Contact
 
-For bugs or feature requests, open an [issue](https://github.com/microsoft/retina/issues).  
-For security or vulnerability concerns, see [SECURITY.md](SECURITY.md).  
-For other communication, contact the maintainers at <retina@microsoft.com>  
+For bugs or feature requests, open an [issue](https://github.com/microsoft/retina/issues).
+For security or vulnerability concerns, see [SECURITY.md](SECURITY.md).
+For other communication, contact the maintainers at <retina@microsoft.com>.
 
 [goreport-img]: https://goreportcard.com/badge/github.com/microsoft/retina
 [goreport]: https://goreportcard.com/report/github.com/microsoft/retina
@@ -142,7 +193,5 @@ For other communication, contact the maintainers at <retina@microsoft.com>
 [retina-test-image]: https://github.com/microsoft/retina/actions/workflows/test.yaml?query=branch%3Amain
 [retinash-badge]: https://github.com/microsoft/retina/actions/workflows/docs.yaml/badge.svg?branch=main
 [retinash]: https://retina.sh/
-[retina-publish-badge]: https://github.com/microsoft/retina/actions/workflows/images.yaml/badge.svg?branch=main
-[retina-publish]: https://github.com/microsoft/retina/actions/workflows/images.yaml?query=branch%3Amain
 [retina-codeql-badge]: https://github.com/microsoft/retina/actions/workflows/codeql.yaml/badge.svg?branch=main
 [retina-golangci-lint-badge]: https://github.com/microsoft/retina/actions/workflows/golangci-lint.yaml/badge.svg?branch=main

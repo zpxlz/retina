@@ -1,28 +1,52 @@
 name: Test Retina Image
 on:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
+
 permissions:
-  actions: read
   contents: read
-  deployments: read
-  packages: none
   pull-requests: write
-  security-events: write
-  issues: write
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test-image:
-    runs-on: ubuntu-latest
+  test-windows:
+    name: Test Windows Unit Tests
+    runs-on: windows-2022
+    timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v5
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "^1.21"
+          go-version-file: go.mod
+
+      - name: Install GNU Make
+        run: choco install make --no-progress --yes
+
+      - name: Run Windows unit tests
+        run: make test-windows
+
+  test-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
 
       - name: Make Retina Test image
         env:
@@ -30,8 +54,88 @@ jobs:
           PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           make test-image IMAGE_NAMESPACE=${{ github.repository }} PLATFORM=linux/amd64
+
       - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-files
-          path: ./coverage*
+          path: ./artifacts/coverage*
+
+      - name: Generate coverage summary
+        run: |
+          COVERAGE_FILE="./artifacts/coverage.out"
+          if [ ! -s "$COVERAGE_FILE" ]; then
+            echo "::warning::Coverage file is empty or missing"
+            echo "## Test Coverage" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo ":warning: No coverage data available." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Filter out generated files (eBPF, mocks)
+          grep -Ev '_bpf\.go|_bpfel_x86\.go|_bpfel_arm64\.go|_generated\.go|mock_' "$COVERAGE_FILE" > coverage_filtered.out
+
+          # Generate function-level coverage report
+          go tool cover -func=coverage_filtered.out > coverage_func.out
+
+          # Extract total coverage percentage
+          TOTAL_COVERAGE=$(grep '^total:' coverage_func.out | awk '{print $NF}')
+
+          # Write step summary
+          {
+            echo "## Test Coverage"
+            echo ""
+            echo ":white_check_mark: **Tests passed**"
+            echo ""
+            echo "| Metric | Value |"
+            echo "| --- | --- |"
+            echo "| Total Coverage | \`${TOTAL_COVERAGE}\` |"
+            echo ""
+            echo "<details>"
+            echo "<summary>Coverage by package (top 20 lowest)</summary>"
+            echo ""
+            echo '```'
+            grep -v '^total:' coverage_func.out | sort -t'%' -k1 -n | head -20
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compare coverage with main branch
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          COVERAGE_FILE="./artifacts/coverage.out"
+          if [ ! -s "$COVERAGE_FILE" ]; then
+            echo "Coverage file is empty or missing, skipping comparison"
+            exit 0
+          fi
+
+          # Filter generated files and prepare current branch coverage
+          grep -Ev '_bpf\.go|_bpfel_x86\.go|_bpfel_arm64\.go|_generated\.go|mock_' "$COVERAGE_FILE" > coveragenew.out
+          cp coveragenew.out coverage.out
+          go tool cover -func=coveragenew.out -o coverageexpanded.out
+
+          # Install Python dependency for GitHub API calls
+          pip install --quiet requests
+
+          # Fetch main branch coverage
+          python3 scripts/coverage/get_coverage.py
+
+          # Check if main branch coverage was downloaded
+          if [ ! -f mainbranchcoverage/coverage.out ]; then
+            echo "No main branch coverage found, skipping comparison"
+            exit 0
+          fi
+
+          # Filter main branch coverage
+          grep -Ev '_bpf\.go|_bpfel_x86\.go|_bpfel_arm64\.go|_generated\.go|mock_' mainbranchcoverage/coverage.out > mainbranchcoverage/coverage_filtered.out
+          mv mainbranchcoverage/coverage_filtered.out mainbranchcoverage/coverage.out
+
+          # Generate expanded coverage for main branch
+          go tool cover -func=mainbranchcoverage/coverage.out -o maincoverageexpanded.out
+
+          # Post PR comment with coverage diff
+          python3 scripts/coverage/compare_cov.py

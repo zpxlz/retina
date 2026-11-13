@@ -21,16 +21,16 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-func getCaptureAndPrintCaptureResult(kubeClient *kubernetes.Clientset, name, namespace string) error {
-	return listCapturesAndPrintCaptureResults(kubeClient, name, namespace)
+func getCaptureAndPrintCaptureResult(ctx context.Context, kubeClient kubernetes.Interface, name, namespace string) error {
+	return listCapturesAndPrintCaptureResults(ctx, kubeClient, name, namespace)
 }
 
-func listCapturesInNamespaceAndPrintCaptureResults(kubeClient *kubernetes.Clientset, namespace string) error {
-	return listCapturesAndPrintCaptureResults(kubeClient, "", namespace)
+func listCapturesInNamespaceAndPrintCaptureResults(ctx context.Context, kubeClient *kubernetes.Clientset, namespace string) error {
+	return listCapturesAndPrintCaptureResults(ctx, kubeClient, "", namespace)
 }
 
 // listCapturesAndPrintCaptureResults list captures and print the running jobs into properly aligned text.
-func listCapturesAndPrintCaptureResults(kubeClient *kubernetes.Clientset, name, namespace string) error {
+func listCapturesAndPrintCaptureResults(ctx context.Context, kubeClient kubernetes.Interface, name, namespace string) error {
 	jobListOpt := metav1.ListOptions{}
 	if len(name) != 0 {
 		captureJobSelector := &metav1.LabelSelector{
@@ -45,7 +45,7 @@ func listCapturesAndPrintCaptureResults(kubeClient *kubernetes.Clientset, name, 
 		}
 	}
 
-	jobList, err := kubeClient.BatchV1().Jobs(namespace).List(context.TODO(), jobListOpt)
+	jobList, err := kubeClient.BatchV1().Jobs(namespace).List(ctx, jobListOpt)
 	if err != nil {
 		return err
 	}
@@ -74,32 +74,26 @@ func printCaptureResult(captureJobs []batchv1.Job) {
 
 	w := new(tabwriter.Writer)
 	w.Init(os.Stdout, 0, 8, 3, ' ', 0)
-	fmt.Fprintln(w, "NAMESPACE\tCAPTURE NAME\tJOBS\tCOMPLETIONS\tAGE")
-	for captureRef, jobs := range captureToJobs {
-		captureRef := strings.Split(captureRef, "/")
-		captureNamespace, captureName := captureRef[0], captureRef[1]
-		jobNames := []string{}
-		completedJobNum := 0
-		age := ""
-		totalJobNum := len(jobs)
-		for _, job := range jobs {
-			jobNames = append(jobNames, job.Name)
-			if job.Status.CompletionTime != nil {
-				completedJobNum += 1
-			}
-		}
-		sort.SliceStable(jobNames, func(i, j int) bool {
-			return jobNames[i] < jobNames[j]
+	fmt.Fprintln(w, "NAMESPACE\tCAPTURE NAME\tJOB\tCOMPLETIONS\tAGE")
+
+	for captureRef := range captureToJobs {
+		jobs := captureToJobs[captureRef]
+		captureParts := strings.Split(captureRef, "/")
+		captureNamespace, captureName := captureParts[0], captureParts[1]
+
+		sort.SliceStable(jobs, func(i, j int) bool {
+			return jobs[i].Name < jobs[j].Name
 		})
-		if len(jobs) > 0 {
-			age = durationUtil.HumanDuration(time.Since(jobs[0].CreationTimestamp.Time))
+
+		for i := range jobs {
+			job := &jobs[i]
+			var completions string
+			if job.Spec.Completions != nil {
+				completions = fmt.Sprintf("%d/%d", job.Status.Succeeded, *job.Spec.Completions)
+			}
+			age := durationUtil.HumanDuration(time.Since(job.CreationTimestamp.Time))
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", captureNamespace, captureName, job.Name, completions, age)
 		}
-
-		jobsNameJoined := strings.Join(jobNames, ",")
-
-		completions := fmt.Sprintf("%d/%d", completedJobNum, totalJobNum)
-		rr := fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t", captureNamespace, captureName, jobsNameJoined, completions, age)
-		fmt.Fprintln(w, rr)
 	}
 	w.Flush()
 	fmt.Println()

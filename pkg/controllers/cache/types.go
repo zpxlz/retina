@@ -8,7 +8,7 @@ import (
 	"github.com/microsoft/retina/pkg/common"
 )
 
-//go:generate go run github.com/golang/mock/mockgen@v1.6.0 -destination=mock_cacheinterface.go -copyright_file=../../lib/ignore_headers.txt -package=cache github.com/microsoft/retina/pkg/controllers/cache CacheInterface
+//go:generate go run go.uber.org/mock/mockgen@v0.4.0 -destination=mock_cacheinterface.go -copyright_file=../../lib/ignore_headers.txt -package=cache github.com/microsoft/retina/pkg/controllers/cache CacheInterface
 type CacheInterface interface {
 	// GetPodByIP returns the retina endpoint for the given IP.
 	GetPodByIP(ip string) *common.RetinaEndpoint
@@ -20,6 +20,8 @@ type CacheInterface interface {
 	GetObjByIP(ip string) interface{}
 	// GetIPsByNamespace returns the net.IPs for a given namespace.
 	GetIPsByNamespace(ns string) []net.IP
+	// GetAllNamespaces returns all unique namespaces that have at least one endpoint in the cache.
+	GetAllNamespaces() []string
 	// GetAnnotatedNamespaces returns list of namespaces that are annotated with retina to observe.
 	GetAnnotatedNamespaces() []string
 

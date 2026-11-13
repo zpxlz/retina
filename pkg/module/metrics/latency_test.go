@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/cilium/cilium/api/v1/flow"
-	"github.com/golang/mock/gomock"
 	api "github.com/microsoft/retina/crd/api/v1alpha1"
 	"github.com/microsoft/retina/pkg/exporter"
 	"github.com/microsoft/retina/pkg/log"
@@ -17,6 +16,7 @@ import (
 	"github.com/microsoft/retina/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	"go.uber.org/mock/gomock"
 	"gotest.tools/v3/assert"
 )
 
@@ -49,13 +49,13 @@ func TestNewLatencyMetrics(t *testing.T) {
 	for _, option := range options[2:] {
 		lm = NewLatencyMetrics(option, l, "")
 	}
-	if lm.nodeApiServerLatency == nil {
+	if lm.nodeAPIServerLatency == nil {
 		t.Errorf("LatencyMetrics.nodeApiServerLatency should be initialized")
 	}
 	if lm.noResponseMetric == nil {
 		t.Errorf("LatencyMetrics.noResponseMetric should be initialized")
 	}
-	if lm.nodeApiServerHandshakeLatency == nil {
+	if lm.nodeAPIServerHandshakeLatency == nil {
 		t.Errorf("LatencyMetrics.nodeApiServerHandshakeLatency should be initialized")
 	}
 
@@ -99,18 +99,18 @@ func TestProcessFlow(t *testing.T) {
 	lm.apiServerIps[apiSeverIp.String()] = struct{}{}
 
 	// Set mock nodeApiServerLatency.
-	mHist := metrics.NewMockIHistogramVec(ctrl)
+	mHist := metrics.NewMockHistogram(ctrl)
 	mHist.EXPECT().Observe(float64(1)).Return().Times(2)
-	lm.nodeApiServerLatency = mHist
+	lm.nodeAPIServerLatency = mHist
 
 	// Set mock nodeApiServerHandshakeLatency.
-	mHist2 := metrics.NewMockIHistogramVec(ctrl)
+	mHist2 := metrics.NewMockHistogram(ctrl)
 	mHist2.EXPECT().Observe(float64(1)).Return().Times(1)
-	lm.nodeApiServerHandshakeLatency = mHist2
+	lm.nodeAPIServerHandshakeLatency = mHist2
 
 	// Test No response metric.
 	c := prometheus.NewCounter(prometheus.CounterOpts{})
-	mNoResponse := metrics.NewMockICounterVec(ctrl)
+	mNoResponse := metrics.NewMockCounterVec(ctrl)
 	mNoResponse.EXPECT().WithLabelValues("no_response").Return(c).Times(1)
 	lm.noResponseMetric = mNoResponse
 
@@ -121,16 +121,21 @@ func TestProcessFlow(t *testing.T) {
 	 * Test case 1: TCP handshake.
 	 */
 	// Node -> Api server.
-	f1 := utils.ToFlow(t1, apiSeverIp, nodeIp, 80, 443, 6, 3, 0, 0)
-	utils.AddTcpID(f1, 1234)
-	utils.AddTcpFlags(f1, 1, 0, 0, 0, 0, 0)
+	f1 := utils.ToFlow(l, t1, apiSeverIp, nodeIp, 80, 443, 6, 3, 0)
+	ext1 := utils.NewExtensions()
+	utils.AddTCPID(ext1, 1234)
+	utils.AddTCPFlags(f1, 1, 0, 0, 0, 0, 0, 0, 0, 0)
+	utils.SetExtensions(f1, ext1)
 	f1.Destination = &flow.Endpoint{
 		PodName: "kubernetes-apiserver",
 	}
+
 	// Api server -> Node.
-	f2 := utils.ToFlow(t2, nodeIp, apiSeverIp, 443, 80, 6, 2, 0, 0)
-	utils.AddTcpID(f2, 1234)
-	utils.AddTcpFlags(f2, 1, 1, 0, 0, 0, 0)
+	f2 := utils.ToFlow(l, t2, nodeIp, apiSeverIp, 443, 80, 6, 2, 0)
+	ext2 := utils.NewExtensions()
+	utils.AddTCPID(ext2, 1234)
+	utils.AddTCPFlags(f2, 1, 1, 0, 0, 0, 0, 0, 0, 0)
+	utils.SetExtensions(f2, ext2)
 	f2.Source = &flow.Endpoint{
 		PodName: "kubernetes-apiserver",
 	}
@@ -142,9 +147,9 @@ func TestProcessFlow(t *testing.T) {
 	 * Test case 2: Existing TCP connection.
 	 */
 	// Node -> Api server.
-	utils.AddTcpFlags(f1, 1, 0, 0, 0, 0, 0)
+	utils.AddTCPFlags(f1, 1, 0, 0, 0, 0, 0, 0, 0, 0)
 	// Api server -> Node.
-	utils.AddTcpFlags(f2, 0, 1, 0, 0, 0, 0)
+	utils.AddTCPFlags(f2, 0, 1, 0, 0, 0, 0, 0, 0, 0)
 	// Process flow.
 	lm.ProcessFlow(f1)
 	lm.ProcessFlow(f2)

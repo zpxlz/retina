@@ -1,0 +1,80 @@
+package k8s
+
+import (
+	"context"
+	"log/slog"
+	"strings"
+	"sync"
+	"time"
+
+	"k8s.io/apimachinery/pkg/util/runtime"
+
+	"github.com/cilium/cilium/pkg/k8s"
+	"github.com/cilium/cilium/pkg/k8s/watchers"
+	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/option"
+	retinalog "github.com/microsoft/retina/pkg/log"
+)
+
+func init() {
+	// Register custom error handler for the watcher
+	// nolint:reassign // this is the only way to set the error handler
+	runtime.ErrorHandlers = []runtime.ErrorHandler{
+		runtime.ErrorHandler(k8sWatcherErrorHandler),
+	}
+}
+
+var (
+	loggerOnce sync.Once
+	cachedLog  *slog.Logger
+)
+
+// logger returns a zap-backed slog logger. Resolved lazily because
+// SetupZapLogger runs later in program startup than this package's init().
+func logger() *slog.Logger {
+	loggerOnce.Do(func() {
+		cachedLog = retinalog.SlogLogger().With(logfields.LogSubsys, "k8s-watcher")
+	})
+	return cachedLog
+}
+
+func Start(ctx context.Context, k *watchers.K8sWatcher) {
+	logger().Info("Starting Kubernetes watcher")
+
+	option.Config.K8sSyncTimeout = 3 * time.Minute //nolint:gomnd // this duration is self-explanatory
+	k.InitK8sSubsystem(ctx)
+	logger().Info("Kubernetes watcher synced")
+}
+
+// retinaK8sErrorHandler is a custom error handler for the watcher
+// that logs the error and tags the error to easily identify
+func k8sWatcherErrorHandler(c context.Context, e error, s string, i ...interface{}) {
+	if e == nil {
+		// TODO: handle key/values pairs in a better way
+		// current example output: time="2009-11-10T23:00:00Z" level=error msg="msg: Some error message -- key/values: [int 1 str world]"
+		logger().ErrorContext(c, "msg: "+s, "key_values", i)
+		return
+	}
+
+	errStr := e.Error()
+
+	logError := func(er, r string) {
+		logger().Error("Error watching k8s resource",
+			"underlyingError", er,
+			"resource", r,
+		)
+	}
+
+	switch {
+	case strings.Contains(errStr, "Failed to watch *v1.Node"):
+		logError(errStr, "v1.Node")
+	case strings.Contains(errStr, "Failed to watch *v2.CiliumEndpoint"):
+		logError(errStr, "v2.CiliumEndpoint")
+	case strings.Contains(errStr, "Failed to watch *v1.Service"):
+		logError(errStr, "v1.Service")
+	case strings.Contains(errStr, "Failed to watch *v2.CiliumNode"):
+		logError(errStr, "v2.CiliumNode")
+	default:
+		k8s.K8sErrorHandler(c, e, s, i...)
+	}
+}

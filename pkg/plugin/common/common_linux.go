@@ -5,30 +5,24 @@
 package common
 
 import (
+	"bufio"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"syscall"
 
+	"github.com/blang/semver/v4"
+	"github.com/cilium/cilium/pkg/versioncheck"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/perf"
+	"github.com/google/gopacket/layers"
 	"github.com/microsoft/retina/pkg/log"
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
 )
 
-//go:generate go run github.com/golang/mock/mockgen@v1.6.0 -destination=mocks/mock_types.go -package=mocks . ITracer
-
-// Interface for IG tracers.
-// Ref: https://pkg.go.dev/github.com/inspektor-gadget/inspektor-gadget@v0.18.1/pkg/gadgets/trace/dns/tracer#Tracer
-type ITracer interface {
-	SetEventHandler(interface{})
-	Attach(pid uint32) error
-	Detach(pid uint32) error
-	Close()
-}
-
-// Interface for IG event handlers. Maps to cilum Flow.
+// ProtocolToFlow converts a protocol string to the corresponding Unix protocol number.
 func ProtocolToFlow(protocol string) int {
 	switch protocol {
 	case "tcp":
@@ -41,18 +35,21 @@ func ProtocolToFlow(protocol string) int {
 }
 
 // Refer: https://www.iana.org/assignments/dns-parameters/dns-parameters.xhtml#dns-parameters-6
+// Inspektor gadget uses Gopacket pkg for DNS response codes.
+// Ref: https://github.com/google/gopacket/blob/32ee38206866f44a74a6033ec26aeeb474506804/layers/dns.go#L129
 func RCodeToFlow(rCode string) uint32 {
-	if strings.EqualFold(rCode, "NoError") {
+	switch rCode {
+	case layers.DNSResponseCodeNoErr.String():
 		return 0
-	} else if strings.EqualFold(rCode, "FormErr") {
+	case layers.DNSResponseCodeFormErr.String():
 		return 1
-	} else if strings.EqualFold(rCode, "ServFail") {
+	case layers.DNSResponseCodeServFail.String():
 		return 2
-	} else if strings.EqualFold(rCode, "NXDomain") {
+	case layers.DNSResponseCodeNXDomain.String():
 		return 3
-	} else if strings.EqualFold(rCode, "NotImp") {
+	case layers.DNSResponseCodeNotImp.String():
 		return 4
-	} else if strings.EqualFold(rCode, "Refused") {
+	case layers.DNSResponseCodeRefused.String():
 		return 5
 	}
 	return 24
@@ -85,4 +82,58 @@ func NewPerfReader(l *log.ZapLogger, m *ebpf.Map, max, min int) (*perf.Reader, e
 		}
 	}
 	return nil, errors.New("failed to create perf reader")
+}
+
+// Function to only extract the X.Y version components, used as fallback for version.GetKernelVersion()
+// Needed for images which don't follow standard Linux version format, e.g.: 5.15.153.1-microsoft-standard-WSL2
+func GetKernelVersionMajMin() (semver.Version, error) {
+	var unameBuf unix.Utsname
+	if err := unix.Uname(&unameBuf); err != nil {
+		return semver.Version{}, err //nolint:wrapcheck // no additional context needed
+	}
+
+	ver := string(unameBuf.Release[:])
+	verStrs := strings.Split(ver, ".")
+
+	if len(verStrs) < 2 {
+		return semver.Version{}, fmt.Errorf("kernel version string is malformatted: %q", ver) //nolint:err113 // ignore
+	}
+	return versioncheck.Version(strings.Join(verStrs[:2], ".")) //nolint:wrapcheck // no additional context needed
+}
+
+func IsAzureLinux() bool {
+	paths := []string{"/etc/os-release", "/usr/lib/os-release"}
+	for _, path := range paths {
+		if id := readIDField(path); id == "azurelinux" || id == "mariner" {
+			return true
+		}
+	}
+	return false
+}
+
+func readIDField(path string) string {
+	file, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "ID=") {
+			return strings.Trim(strings.TrimPrefix(line, "ID="), `"`)
+		}
+	}
+	return ""
+}
+
+// IsFtraceEnabled checks if ftrace is enabled in the kernel.
+// This is required for fexit/fentry programs to work.
+func IsFtraceEnabled() bool {
+	data, err := os.ReadFile("/proc/sys/kernel/ftrace_enabled")
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(data)) == "1"
 }

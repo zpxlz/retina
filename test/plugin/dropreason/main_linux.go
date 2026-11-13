@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"time"
 
@@ -23,18 +24,18 @@ func main() {
 	log.SetupZapLogger(opts)
 	l := log.Logger().Named("test-dropreason")
 
-	metrics.InitializeMetrics()
+	metrics.InitializeMetrics(slog.Default())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	cfg := &kcfg.Config{
 		MetricsInterval: 1 * time.Second,
-		EnablePodLevel:  true,
+		EnablePodLevel:  true, // Set to false to test fexit programs
 	}
 
 	// Filtermanager.
-	f, err := filtermanager.Init(3)
+	f, err := filtermanager.Init(3, kcfg.DefaultFilterMapMaxEntries)
 	if err != nil {
 		l.Error("Start filtermanager failed", zap.Error(err))
 		return
@@ -67,31 +68,31 @@ func main() {
 
 	err = tt.Stop()
 	if err != nil {
-		l.Error("Stop failed:%v", zap.Error(err))
+		l.Error("Stop failed:", zap.Error(err))
 		return
 	}
 
 	err = tt.Generate(ctx)
 	if err != nil {
-		l.Error("Generate failed:%v", zap.Error(err))
+		l.Error("Generate failed:", zap.Error(err))
 		return
 	}
 
 	err = tt.Compile(ctx)
 	if err != nil {
-		l.Error("Compile failed:%v", zap.Error(err))
+		l.Error("Compile failed:", zap.Error(err))
 		return
 	}
 
 	err = tt.Init()
 	if err != nil {
-		l.Error("Init failed:%v", zap.Error(err))
+		l.Error("Init failed:", zap.Error(err))
 		return
 	}
 
 	err = tt.Start(ctx)
 	if err != nil {
-		l.Error("Start failed:%v", zap.Error(err))
+		l.Error("Start failed:", zap.Error(err))
 		return
 	}
 	l.Info("Started dropreason")

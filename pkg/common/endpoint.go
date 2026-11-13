@@ -5,12 +5,22 @@ package common
 import (
 	"fmt"
 	"net"
+
+	"github.com/pkg/errors"
 )
+
+var ErrNoIPFoundForEndpoint = errors.New("no IP found for endpoint")
+
+var ErrNoPrimaryIPFoundEndpoint = errors.New("no primary IP found for endpoint")
 
 func NewRetinaEndpoint(name, namespace string, ips *IPAddresses) *RetinaEndpoint {
 	return &RetinaEndpoint{
 		BaseObject: GetBaseObject(name, namespace, ips),
 	}
+}
+
+func (ep *RetinaEndpoint) String() string {
+	return ep.NamespacedName()
 }
 
 func (ep *RetinaEndpoint) DeepCopy() interface{} {
@@ -19,6 +29,7 @@ func (ep *RetinaEndpoint) DeepCopy() interface{} {
 
 	newEp := &RetinaEndpoint{
 		BaseObject: ep.BaseObject.DeepCopy(),
+		nodeIP:     ep.nodeIP,
 	}
 
 	if ep.ownerRefs != nil {
@@ -52,7 +63,21 @@ func (ep *RetinaEndpoint) DeepCopy() interface{} {
 	return newEp
 }
 
-func (ep *RetinaEndpoint) IPs() *IPAddresses {
+func (ep *RetinaEndpoint) IPs() ([]string, error) {
+	ep.RLock()
+	defer ep.RUnlock()
+
+	if ep.ips != nil {
+		ips := ep.ips.GetIPs()
+		if len(ips) > 0 {
+			return ips, nil
+		}
+	}
+
+	return []string{}, errors.Wrap(ErrNoIPFoundForEndpoint, ep.Key())
+}
+
+func (ep *RetinaEndpoint) NetIPs() *IPAddresses {
 	ep.RLock()
 	defer ep.RUnlock()
 
@@ -129,32 +154,38 @@ func (ep *RetinaEndpoint) SetAnnotations(annotations map[string]string) {
 	}
 }
 
-func (e *RetinaEndpoint) PrimaryIP() (string, error) {
-	e.RLock()
-	defer e.RUnlock()
+func (ep *RetinaEndpoint) PrimaryIP() (string, error) {
+	ep.RLock()
+	defer ep.RUnlock()
 
-	if e.ips != nil {
-		pip := e.ips.PrimaryIP()
+	if ep.ips != nil {
+		pip := ep.ips.PrimaryIP()
 		if pip != "" {
 			return pip, nil
 		}
 	}
 
-	return "", fmt.Errorf("no primary IP found for endpoint %s", e.Key())
+	return "", errors.Wrapf(ErrNoPrimaryIPFoundEndpoint, "endpoint: %s", ep.Key())
 }
 
-func (e *RetinaEndpoint) PrimaryNetIP() (net.IP, error) {
-	e.RLock()
-	defer e.RUnlock()
+func (ep *RetinaEndpoint) PrimaryNetIP() (net.IP, error) {
+	ep.RLock()
+	defer ep.RUnlock()
 
-	if e.ips != nil {
-		pip := e.ips.PrimaryNetIP()
+	if ep.ips != nil {
+		pip := ep.ips.PrimaryNetIP()
 		if pip != nil {
 			return pip, nil
 		}
 	}
 
-	return nil, fmt.Errorf("no primary IP found for endpoint %s", e.Key())
+	return nil, errors.Wrapf(ErrNoPrimaryIPFoundEndpoint, "endpoint: %s", ep.Key())
+}
+
+func (ep *RetinaEndpoint) NodeIP() string {
+	ep.RLock()
+	defer ep.RUnlock()
+	return ep.nodeIP
 }
 
 func (o *OwnerReference) DeepCopy() *OwnerReference {

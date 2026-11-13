@@ -20,6 +20,7 @@ spec:
       namespace: retina
     spec:
       serviceAccountName: retina-agent
+      terminationGracePeriodSeconds: 90
       tolerations:
         - key: node-role.kubernetes.io/control-plane
           operator: Exists
@@ -41,8 +42,19 @@ spec:
           command:
             - powershell.exe
             - -command
+            {{- if semverCompare ">=1.28" .Capabilities.KubeVersion.GitVersion }}
+            - $env:CONTAINER_SANDBOX_MOUNT_POINT/controller.exe --config ./retina/config.yaml
+            {{- else }}
             - .\setkubeconfigpath.ps1; ./controller.exe --config ./retina/config.yaml --kubeconfig ./kubeconfig
-            # .\setkubeconfigpath.ps1; Start-Sleep -s 1000
+            {{- end }}
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - powershell.exe
+                  - -NoProfile
+                  - -Command
+                  - New-Item -ItemType File -Path (Join-Path $env:CONTAINER_SANDBOX_MOUNT_POINT '.retina-shutdown') -Force | Out-Null; Start-Sleep -Seconds 90
           securityContext:
             privileged: true
           volumeMounts:
@@ -66,5 +78,5 @@ data:
       host: "0.0.0.0"
       port: 10093
     logLevel: info
-    enabledPlugin: ["hnsstats"] 
-    metricsInterval: 10
+    enabledPlugin: ["hnsstats"]
+    metricsIntervalDuration: "10s"

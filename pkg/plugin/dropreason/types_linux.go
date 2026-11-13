@@ -12,18 +12,17 @@ import (
 	kcfg "github.com/microsoft/retina/pkg/config"
 	"github.com/microsoft/retina/pkg/enricher"
 	"github.com/microsoft/retina/pkg/log"
-	"github.com/microsoft/retina/pkg/metrics"
-	"github.com/microsoft/retina/pkg/plugin/api"
+	"github.com/microsoft/retina/pkg/utils"
 )
 
 const (
-	Name                  api.PluginName = "dropreason"
-	bpfSourceDir          string         = "_cprog"
-	bpfSourceFileName     string         = "drop_reason.c"
-	bpfObjectFileName     string         = "kprobe_bpf.o"
-	dynamicHeaderFileName string         = "dynamic.h"
-	buffer                int            = 10000
-	workers               int            = 2
+	name                  string = "dropreason"
+	bpfSourceDir          string = "_cprog"
+	bpfSourceFileName     string = "drop_reason.c"
+	bpfObjectFileName     string = "kprobe_bpf.o"
+	dynamicHeaderFileName string = "dynamic.h"
+	buffer                int    = 10000
+	workers               int    = 2
 )
 
 // Determined via testing on a large cluster.
@@ -31,24 +30,57 @@ const (
 var perCPUBuffer = 16
 
 type dropReason struct {
-	cfg                    *kcfg.Config
-	l                      *log.ZapLogger
-	KNfHook                link.Link
-	KRetnfhook             link.Link
-	KTCPAccept             link.Link
-	KRetTCPAccept          link.Link
-	KRetTCPConnect         link.Link
-	KNfNatInet             link.Link
-	KRetNfNatInet          link.Link
-	KNfConntrackConfirm    link.Link
-	KRetNfConntrackConfirm link.Link
-	metricsMapData         IMap
-	isRunning              bool
-	reader                 IPerfReader
-	enricher               enricher.EnricherInterface
-	recordsChannel         chan perf.Record
-	wg                     sync.WaitGroup
-	externalChannel        chan *hubblev1.Event
+	cfg             *kcfg.Config
+	l               *log.ZapLogger
+	hooks           []link.Link
+	metricsMapData  IMap
+	isRunning       bool
+	reader          IPerfReader
+	enricher        enricher.EnricherInterface
+	recordsChannel  chan perf.Record
+	wg              sync.WaitGroup
+	externalChannel chan *hubblev1.Event
+}
+
+type allFexitObjects struct {
+	allFexitPrograms
+	kprobeMaps
+}
+
+type allFexitPrograms struct {
+	InetCskAcceptFexit      *ebpf.Program `ebpf:"inet_csk_accept_fexit"`
+	NfConntrackConfirmFexit *ebpf.Program `ebpf:"nf_conntrack_confirm_fexit"`
+	NfHookSlowFexit         *ebpf.Program `ebpf:"nf_hook_slow_fexit"`
+	NfNatInetFnFexit        *ebpf.Program `ebpf:"nf_nat_inet_fn_fexit"`
+	TcpV4ConnectFexit       *ebpf.Program `ebpf:"tcp_v4_connect_fexit"` // nolint:revive // needs to match generated code
+}
+
+type marinerObjects struct {
+	marinerPrograms
+	kprobeMaps
+}
+
+type marinerPrograms struct {
+	InetCskAcceptFexit *ebpf.Program `ebpf:"inet_csk_accept_fexit"`
+	NfHookSlowFexit    *ebpf.Program `ebpf:"nf_hook_slow_fexit"`
+	TcpV4ConnectFexit  *ebpf.Program `ebpf:"tcp_v4_connect_fexit"` // nolint:revive // needs to match generated code
+}
+
+type allKprobeObjects struct {
+	allKprobePrograms
+	kprobeMaps
+}
+
+type allKprobePrograms struct {
+	InetCskAccept         *ebpf.Program `ebpf:"inet_csk_accept"`
+	InetCskAcceptRet      *ebpf.Program `ebpf:"inet_csk_accept_ret"`
+	NfConntrackConfirm    *ebpf.Program `ebpf:"nf_conntrack_confirm"`
+	NfConntrackConfirmRet *ebpf.Program `ebpf:"nf_conntrack_confirm_ret"`
+	NfHookSlow            *ebpf.Program `ebpf:"nf_hook_slow"`
+	NfHookSlowRet         *ebpf.Program `ebpf:"nf_hook_slow_ret"`
+	NfNatInetFn           *ebpf.Program `ebpf:"nf_nat_inet_fn"`
+	NfNatInetFnRet        *ebpf.Program `ebpf:"nf_nat_inet_fn_ret"`
+	TcpV4ConnectRet       *ebpf.Program `ebpf:"tcp_v4_connect_ret"` // nolint:revive // needs to match generated code
 }
 
 type (
@@ -58,7 +90,7 @@ type (
 // Interface to https://pkg.go.dev/github.com/cilium/ebpf#Map.
 // Added for unit tests.
 //
-//go:generate go run github.com/golang/mock/mockgen@v1.6.0 -source=types_linux.go -destination=mocks/mock_types.go -package=dropreason . IMap IMapIterator IPerfReader
+//go:generate go run go.uber.org/mock/mockgen@v0.4.0 -source=types_linux.go -destination=mocks/mock_types_linux.go -package=dropreason . IMap IMapIterator IPerfReader
 type IMapIterator interface {
 	Next(keyOut interface{}, valueOut interface{}) bool
 	Err() error
@@ -82,14 +114,14 @@ type dropMetricValues []kprobeMetricsMapValue //nolint:typecheck
 
 func (dk *dropMetricKey) getType() string {
 	//nolint:typecheck
-	return metrics.GetDropType(dk.DropType).String()
+	return utils.DropReason(dk.DropType).String()
 }
 
 func (dk *dropMetricKey) getDirection() string {
 	switch dk.getType() {
-	case metrics.TCP_CONNECT_BASIC.String():
+	case utils.DropReason_TCP_CONNECT_BASIC.String():
 		return "egress"
-	case metrics.TCP_ACCEPT_BASIC.String():
+	case utils.DropReason_TCP_ACCEPT_BASIC.String():
 		return "ingress"
 	}
 	return "unknown"

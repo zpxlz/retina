@@ -1,0 +1,83 @@
+{{- if and .Values.agent.enabled .Values.serviceAccount.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: retina-cluster-reader
+rules:
+  - apiGroups: [""] # "" indicates the core API group
+    resources: ["pods", "services", "replicationcontrollers", "nodes", "namespaces"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: ["networking.azure.com"]
+    resources: ["clusterobservers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups:
+      - retina.sh
+    resources:
+      - retinaendpoints
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+    - cilium.io
+    resources:
+    - ciliumnodes
+    - ciliumidentities
+    - ciliumendpoints
+    verbs:
+    - get
+    - list
+    - watch
+  - apiGroups:
+    - discovery.k8s.io
+    resources:
+    - endpointslices
+    verbs:
+    - get
+    - list
+    - watch
+  {{- if .Values.operator.enabled }}
+  - apiGroups:
+      - retina.sh
+    resources:
+      - retinaendpoints
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - retina.sh
+    resources:
+      - metricsconfigurations
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - retina.sh
+    resources:
+      - retinaendpoints/finalizers
+    verbs:
+      - update
+  - apiGroups:
+      - retina.sh
+    resources:
+      - retinaendpoints/status
+    verbs:
+      - get
+      - patch
+      - update
+  {{- end }}
+
+{{- end}}

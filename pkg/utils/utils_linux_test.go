@@ -1,24 +1,28 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// nolint //Ignore lint
 package utils
 
 import (
+	"fmt"
 	"net"
 	"testing"
 
 	"github.com/cilium/cilium/api/v1/flow"
-	"github.com/microsoft/retina/pkg/log"
 	"github.com/stretchr/testify/assert"
+	"github.com/vishvananda/netlink"
+
+	"github.com/microsoft/retina/pkg/log"
 )
 
 func TestToFlow(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	l, _ := log.SetupZapLogger(log.GetDefaultLogOpts())
 
 	ts := int64(1649748687588860)
-	f := ToFlow(ts, net.ParseIP("1.1.1.1").To4(),
+	f := ToFlow(l, ts, net.ParseIP("1.1.1.1").To4(),
 		net.ParseIP("2.2.2.2").To4(),
-		443, 80, 6, uint32(1), flow.Verdict_FORWARDED, 0)
+		443, 80, 6, uint8(1), flow.Verdict_FORWARDED)
 	/*
 		expected  ---> flow.Flow{
 			IP: &flow.IP{
@@ -40,10 +44,9 @@ func TestToFlow(t *testing.T) {
 	assert.Equal(t, f.IP.Source, "1.1.1.1")
 	assert.Equal(t, f.IP.Destination, "2.2.2.2")
 	assert.Equal(t, f.IP.IpVersion, flow.IPVersion_IPv4)
-	assert.EqualValues(t, f.L4.Protocol.(*flow.Layer4_TCP).TCP.SourcePort, uint32(443))
-	assert.EqualValues(t, f.L4.Protocol.(*flow.Layer4_TCP).TCP.DestinationPort, uint32(80))
+	assert.EqualValues(t, f.GetL4().Protocol.(*flow.Layer4_TCP).TCP.SourcePort, uint32(443))
+	assert.EqualValues(t, f.GetL4().Protocol.(*flow.Layer4_TCP).TCP.DestinationPort, uint32(80))
 	assert.NotNil(t, f.Time)
-	assert.NotNil(t, f.Extensions)
 	assert.Equal(t, f.Type, flow.FlowType_L3_L4)
 
 	if !f.GetTime().IsValid() {
@@ -60,34 +63,171 @@ func TestToFlow(t *testing.T) {
 	}
 	expectedSubtype := []int32{3, 0, 10, 11, 0}
 	for idx, val := range []uint32{0, 1, 2, 3, 4} {
-		f = ToFlow(ts, net.ParseIP("1.1.1.1").To4(),
+		f = ToFlow(l, ts, net.ParseIP("1.1.1.1").To4(),
 			net.ParseIP("2.2.2.2").To4(),
-			443, 80, 6, uint32(val), flow.Verdict_FORWARDED, 0)
+			443, 80, 6, uint8(val), flow.Verdict_FORWARDED)
 		assert.EqualValues(t, f.TraceObservationPoint, expectedObsPoint[idx])
 		assert.EqualValues(t, f.GetEventType().GetSubType(), expectedSubtype[idx])
 	}
 }
 
 func TestAddPacketSize(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	l, _ := log.SetupZapLogger(log.GetDefaultLogOpts())
 
 	ts := int64(1649748687588864)
-	f := ToFlow(ts, net.ParseIP("1.1.1.1").To4(),
+	fl := ToFlow(
+		l,
+		ts,
+		net.ParseIP("1.1.1.1").To4(),
 		net.ParseIP("2.2.2.2").To4(),
-		443, 80, 6, uint32(1), flow.Verdict_FORWARDED, 0)
-	AddPacketSize(f, uint64(100))
+		443,
+		80,
+		6,
+		uint8(1),
+		flow.Verdict_FORWARDED,
+	)
+	ext := NewExtensions()
+	AddPacketSize(ext, uint32(100))
+	SetExtensions(fl, ext)
 
-	res := PacketSize(f)
-	assert.EqualValues(t, res, uint64(100))
+	res := PacketSize(fl)
+	assert.EqualValues(t, res, uint32(100))
 }
 
 func TestTcpID(t *testing.T) {
-	log.SetupZapLogger(log.GetDefaultLogOpts())
+	l, _ := log.SetupZapLogger(log.GetDefaultLogOpts())
 
 	ts := int64(1649748687588864)
-	f := ToFlow(ts, net.ParseIP("1.1.1.1").To4(),
+	fl := ToFlow(
+		l,
+		ts,
+		net.ParseIP("1.1.1.1").To4(),
 		net.ParseIP("2.2.2.2").To4(),
-		443, 80, 6, uint32(1), flow.Verdict_FORWARDED, 0)
-	AddTcpID(f, uint64(1234))
-	assert.EqualValues(t, GetTcpID(f), uint64(1234))
+		443,
+		80,
+		6,
+		uint8(1),
+		flow.Verdict_FORWARDED,
+	)
+
+	ext := NewExtensions()
+	AddTCPID(ext, uint64(1234))
+	SetExtensions(fl, ext)
+	assert.EqualValues(t, GetTCPID(fl), uint64(1234))
+}
+
+func TestAddDropReason(t *testing.T) {
+	testCases := []struct {
+		name                 string
+		dropReason           uint16
+		expectedDesc         flow.DropReason
+		expectedReason       uint32
+		expectedRetinaReason string
+	}{
+		{
+			name:           "IPTable Drop",
+			dropReason:     0,
+			expectedDesc:   flow.DropReason_POLICY_DENIED,
+			expectedReason: 133,
+		},
+		{
+			name:           "SNAT Drop",
+			dropReason:     1,
+			expectedDesc:   flow.DropReason_SNAT_NO_MAP_FOUND,
+			expectedReason: 134,
+		},
+		{
+			name:           "Unknown Connection Tracking State",
+			dropReason:     5,
+			expectedDesc:   flow.DropReason_UNKNOWN_CONNECTION_TRACKING_STATE,
+			expectedReason: 138,
+		},
+		{
+			name:           "Unknown Drop Reason",
+			dropReason:     6,
+			expectedDesc:   flow.DropReason_DROP_REASON_UNKNOWN,
+			expectedReason: 0,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &flow.Flow{}
+			ext := NewExtensions()
+			AddDropReason(f, ext, tc.dropReason)
+			SetExtensions(f, ext)
+			assert.Equal(t, f.DropReasonDesc, tc.expectedDesc)
+			assert.Equal(t, f.Verdict, flow.Verdict_DROPPED)
+			assert.NotNil(t, f.EventType.Type, 1)
+			assert.EqualValues(t, f.EventType.GetSubType(), int32(tc.expectedDesc))
+			assert.NotNil(t, DropReasonDescription(f), DropReason_name[int32(tc.dropReason)])
+		})
+	}
+}
+
+func TestZoneHelpers(t *testing.T) {
+	tests := []struct {
+		name            string
+		srcZone         string
+		dstZone         string
+		expectedSrcZone string
+		expectedDstZone string
+	}{
+		{
+			name:            "both zones set",
+			srcZone:         "zone-1",
+			dstZone:         "zone-2",
+			expectedSrcZone: "zone-1",
+			expectedDstZone: "zone-2",
+		},
+		{
+			name:            "empty zones stored as empty strings",
+			srcZone:         "",
+			dstZone:         "",
+			expectedSrcZone: "",
+			expectedDstZone: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &flow.Flow{}
+			ext := NewExtensions()
+			AddZones(ext, tc.srcZone, tc.dstZone)
+			SetExtensions(f, ext)
+
+			assert.Equal(t, tc.expectedSrcZone, SourceZone(f))
+			assert.Equal(t, tc.expectedDstZone, DestinationZone(f))
+		})
+	}
+}
+
+func TestZoneHelpers_NilExtensions(t *testing.T) {
+	f := &flow.Flow{}
+	assert.Equal(t, "unknown", SourceZone(f))
+	assert.Equal(t, "unknown", DestinationZone(f))
+}
+
+func TestAddZones_NilStruct(t *testing.T) {
+	// Should not panic.
+	AddZones(nil, "zone-1", "zone-2")
+}
+
+func TestIsDefaultRoute(t *testing.T) {
+	tests := []struct {
+		Route           netlink.Route
+		ShouldBeDefault bool
+	}{
+		{Route: netlink.Route{Dst: nil}, ShouldBeDefault: true},
+		{Route: netlink.Route{Dst: &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}}, ShouldBeDefault: true},
+		{Route: netlink.Route{Dst: &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)}}, ShouldBeDefault: true},
+		{Route: netlink.Route{Dst: &net.IPNet{IP: net.IPv4(168, 192, 1, 0), Mask: net.CIDRMask(8, 32)}}, ShouldBeDefault: false},
+		{Route: netlink.Route{Dst: &net.IPNet{IP: net.IPv6loopback, Mask: net.CIDRMask(64, 128)}}, ShouldBeDefault: false},
+	}
+
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("%s should be default: %t", test.Route.Dst, test.ShouldBeDefault), func(t *testing.T) {
+			assert.Equal(t, test.ShouldBeDefault, isDefaultRoute(test.Route))
+		})
+	}
 }

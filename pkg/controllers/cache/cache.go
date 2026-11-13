@@ -5,6 +5,7 @@ package cache
 import (
 	"fmt"
 	"net"
+	"sort"
 	"sync"
 
 	"github.com/microsoft/retina/pkg/common"
@@ -152,7 +153,7 @@ func (c *Cache) getObjByIPType(ip string, t objectType) interface{} {
 // GetObjByIP returns the retina object for the given IP.
 func (c *Cache) GetObjByIP(ip string) interface{} {
 	if ep := c.GetPodByIP(ip); ep != nil {
-		c.l.Debug("pod found for IP", zap.String("ip", ip), zap.String("pod Name", ep.Key()))
+		c.l.Debug("pod found for IP", zap.String("ip", ip), zap.Stringer("pod", ep))
 		return ep
 	}
 
@@ -165,6 +166,22 @@ func (c *Cache) GetObjByIP(ip string) interface{} {
 	}
 
 	return nil
+}
+
+func (c *Cache) GetAllNamespaces() []string {
+	c.RLock()
+	defer c.RUnlock()
+
+	unique := make(map[string]struct{})
+	for _, ep := range c.epMap {
+		unique[ep.Namespace()] = struct{}{}
+	}
+
+	namespaces := make([]string, 0, len(unique))
+	for ns := range unique {
+		namespaces = append(namespaces, ns)
+	}
+	return namespaces
 }
 
 func (c *Cache) GetIPsByNamespace(ns string) []net.IP {
@@ -201,25 +218,29 @@ func (c *Cache) UpdateRetinaEndpoint(ep *common.RetinaEndpoint) error {
 
 // updateEndpoint updates the cache with the given retina endpoint.
 func (c *Cache) updateEndpoint(ep *common.RetinaEndpoint) error {
-	ip, err := ep.PrimaryIP()
+	ips, err := ep.IPs()
 	if err != nil {
-		c.l.Error("updateEndpoint: error getting primary IP for pod", zap.String("pod", ep.Key()), zap.Error(err))
+		c.l.Error("updateEndpoint: error getting IPs for pod", zap.String("pod", ep.Key()), zap.Error(err))
 		return err
 	}
-	// delete if any existing object is using this IP
+	// delete if any existing object is using any IP
 	// send a delete event for the existing object
-	err = c.deleteByIP(ip, ep.Key())
-	if err != nil {
-		c.l.Error("updateEndpoint: error deleting existing object for IP",
-			zap.String("pod", ep.Key()),
-			zap.String("ip", ip),
-			zap.Error(err),
-		)
-		return err
+	for _, ip := range ips {
+		err = c.deleteByIP(ip, ep.Key())
+		if err != nil {
+			c.l.Error("updateEndpoint: error deleting existing object for IP",
+				zap.String("pod", ep.Key()),
+				zap.String("ip", ip),
+				zap.Error(err),
+			)
+			return err
+		}
 	}
 
 	c.epMap[ep.Key()] = ep
-	c.ipToEpKey[ip] = ep.Key()
+	for _, ip := range ips {
+		c.ipToEpKey[ip] = ep.Key()
+	}
 
 	// notify pubsub that the endpoint has been updated
 	c.publish(EventTypePodAdded, ep)
@@ -315,14 +336,16 @@ func (c *Cache) deleteEndpoint(epKey string) error {
 		return nil
 	}
 
-	ip, err := ep.PrimaryIP()
+	ips, err := ep.IPs()
 	if err != nil {
 		c.l.Error("error getting primary IP for pod", zap.String("pod", ep.Key()), zap.Error(err))
 		return err
 	}
 
 	delete(c.epMap, epKey)
-	delete(c.ipToEpKey, ip)
+	for _, ip := range ips {
+		delete(c.ipToEpKey, ip)
+	}
 
 	c.publish(EventTypePodDeleted, ep)
 
@@ -483,5 +506,6 @@ func (c *Cache) GetAnnotatedNamespaces() []string {
 	for k := range c.nsAnnotated {
 		ns = append(ns, k)
 	}
+	sort.Strings(ns)
 	return ns
 }

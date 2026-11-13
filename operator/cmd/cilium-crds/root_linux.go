@@ -1,0 +1,234 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium and Retina
+
+// NOTE: this file was originally a modified/slimmed-down version of Cilium's operator
+// to provide Retina with a hive to run Cilium's garbage collection Cells.
+// Now, it contains Retina-related code ported into Cells.
+
+package ciliumcrds
+
+import (
+	"context"
+	"crypto/rand"
+	"fmt"
+	"log/slog"
+	"math/big"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/cilium/cilium/pkg/hive"
+	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
+	"github.com/cilium/cilium/pkg/logging"
+	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/metrics"
+	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/hive/cell"
+	"github.com/microsoft/retina/internal/buildinfo"
+	"github.com/microsoft/retina/operator/cilium-crds/config"
+	"github.com/microsoft/retina/pkg/log"
+	"github.com/pkg/errors"
+	"github.com/spf13/viper"
+	"go.uber.org/zap"
+	"k8s.io/client-go/tools/leaderelection"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
+)
+
+var (
+	// set logger field: subsys=retina-operator
+	binaryName                         = filepath.Base(os.Args[0])
+	slogLoggerOnce                     sync.Once
+	cachedSlogLogger                   *slog.Logger
+	operatorIDLength                   = 10
+	errLeaderElectionNamespaceRequired = errors.New("--leader-election-namespace must be set")
+
+	// Populated by initEnv before the hive runs.
+	leaderElection struct {
+		LeaseDuration time.Duration
+		RenewDeadline time.Duration
+		RetryPeriod   time.Duration
+	}
+)
+
+// slogLogger returns a zap-backed slog logger. Resolved lazily so that
+// SetupZapLogger (run in initEnv) is the backing source — that way every
+// call here reaches Application Insights.
+func slogLogger() *slog.Logger {
+	slogLoggerOnce.Do(func() {
+		cachedSlogLogger = log.SlogLogger().With(logfields.LogSubsys, binaryName)
+	})
+	return cachedSlogLogger
+}
+
+func Execute(h *hive.Hive) {
+	initEnv(h.Viper())
+
+	// Use zap-backed slog logger for hive (routes to stdout + Application Insights)
+	if err := h.Run(log.SlogLogger()); err != nil {
+		logging.Fatal(slogLogger(), err.Error())
+	}
+}
+
+func registerOperatorHooks(
+	l *slog.Logger, lc cell.Lifecycle, llc *LeaderLifecycle,
+	clientset k8sClient.Clientset, shutdowner hive.Shutdowner,
+	cfg config.Config,
+) error {
+	leaderElectionNamespace := cfg.LeaderElectionNamespace
+	if leaderElectionNamespace == "" {
+		return errLeaderElectionNamespaceRequired
+	}
+	l.Info("using namespace for leader election lease", "namespace", leaderElectionNamespace)
+	var wg sync.WaitGroup
+	lc.Append(cell.Hook{
+		OnStart: func(cell.HookContext) error {
+			wg.Add(1)
+			go func() {
+				runOperator(l, llc, clientset, shutdowner, leaderElectionNamespace)
+				wg.Done()
+			}()
+			return nil
+		},
+		OnStop: func(ctx cell.HookContext) error {
+			if err := llc.Stop(logging.DefaultSlogLogger, ctx); err != nil {
+				return errors.Wrap(err, "failed to stop operator")
+			}
+			doCleanup()
+			wg.Wait()
+			return nil
+		},
+	})
+	return nil
+}
+
+func initEnv(vp *viper.Viper) {
+	// Prepopulate option.Config with options from CLI.
+
+	// NOTE: if the flag is not provided in operator/cmd/flags.go InitGlobalFlags(), this Populate method overrides
+	// the default values provided in option.Config.
+	// The values will be overridden to the "zero value".
+	// Maybe could create a cell.Config for these instead?
+	// slogloggercheck: using default logger for configuration initialization
+	option.Config.Populate(logging.DefaultSlogLogger, vp)
+
+	leaderElection.LeaseDuration = vp.GetDuration(leaderElectionLeaseDuration)
+	leaderElection.RenewDeadline = vp.GetDuration(leaderElectionRenewDeadline)
+	leaderElection.RetryPeriod = vp.GetDuration(leaderElectionRetryPeriod)
+
+	// Bring up Retina's zap logger (stdout + Application Insights). We redirect
+	// Go's stdlib slog default at it now; the Cilium-side tee has to wait until
+	// after logging.SetupLogging runs, because SetupLogging calls
+	// defaultMultiSlogHandler.SetHandler, which replaces all registered
+	// handlers.
+	_, _ = log.SetupZapLogger(&log.LogOpts{
+		Level:                 option.Config.LogOpt[logging.LevelOpt],
+		ApplicationInsightsID: buildinfo.ApplicationInsightsID,
+		EnableTelemetry:       buildinfo.ApplicationInsightsID != "",
+	}, zap.String("version", buildinfo.Version))
+	log.SetDefaultSlog()
+
+	// Logging should always be bootstrapped first. Do not add any code above this!
+	if err := logging.SetupLogging(option.Config.LogDriver, logging.LogOptions(option.Config.LogOpt), binaryName, option.Config.Debug); err != nil {
+		logging.Fatal(slogLogger(), err.Error())
+	}
+
+	// Register zap + metrics hook AFTER SetupLogging so they survive the
+	// MultiSlogHandler replace. From here on every logging.DefaultSlogLogger
+	// emission fans out to zap → Application Insights.
+	logging.AddHandlers(log.SlogHandler(), metrics.NewLoggingHook())
+
+	option.LogRegisteredSlogOptions(vp, slogLogger())
+	slogLogger().Info("retina operator version", "version", buildinfo.Version)
+}
+
+func doCleanup() {
+	isLeader.Store(false)
+
+	// Cancelling this context here makes sure that if the operator hold the
+	// leader lease, it will be released.
+	leaderElectionCtxCancel()
+}
+
+// runOperator implements the logic of leader election for cilium-operator using
+// built-in leader election capability in kubernetes.
+// See: https://github.com/kubernetes/client-go/blob/master/examples/leader-election/main.go
+func runOperator(l *slog.Logger, lc *LeaderLifecycle, clientset k8sClient.Clientset, shutdowner hive.Shutdowner, leaderElectionNamespace string) {
+	isLeader.Store(false)
+
+	leaderElectionCtx, leaderElectionCtxCancel = context.WithCancel(context.Background())
+
+	// Get hostname for identity name of the lease lock holder.
+	// We identify the leader of the operator cluster using hostname.
+	operatorID, err := os.Hostname()
+	if err != nil {
+		logging.Fatal(l, "Failed to get hostname when generating lease lock identity", logfields.Error, err)
+	}
+	operatorID, err = randomStringWithPrefix(operatorID+"-", operatorIDLength)
+	if err != nil {
+		logging.Fatal(l, "Failed to generate random string for lease lock identity", logfields.Error, err)
+	}
+
+	leResourceLock, err := resourcelock.NewFromKubeconfig(
+		resourcelock.LeasesResourceLock,
+		leaderElectionNamespace,
+		leaderElectionResourceLockName,
+		resourcelock.ResourceLockConfig{
+			// Identity name of the lock holder
+			Identity: operatorID,
+		},
+		clientset.RestConfig(),
+		leaderElection.RenewDeadline)
+	if err != nil {
+		logging.Fatal(l, "Failed to create resource lock for leader election", logfields.Error, err)
+	}
+
+	// Start the leader election for running cilium-operators
+	l.Info("Waiting for leader election")
+	leaderelection.RunOrDie(leaderElectionCtx, leaderelection.LeaderElectionConfig{
+		Name: leaderElectionResourceLockName,
+
+		Lock:            leResourceLock,
+		ReleaseOnCancel: true,
+
+		LeaseDuration: leaderElection.LeaseDuration,
+		RenewDeadline: leaderElection.RenewDeadline,
+		RetryPeriod:   leaderElection.RetryPeriod,
+
+		Callbacks: leaderelection.LeaderCallbacks{
+			OnStartedLeading: func(ctx context.Context) {
+				if err := lc.Start(logging.DefaultSlogLogger, ctx); err != nil {
+					l.Error("Failed to start when elected leader, shutting down", logfields.Error, err)
+					shutdowner.Shutdown(hive.ShutdownWithError(err))
+				}
+			},
+			OnStoppedLeading: func() {
+				l.Info("Leader election lost", "operator-id", operatorID)
+				// Cleanup everything here, and exit.
+				shutdowner.Shutdown(hive.ShutdownWithError(errors.New("Leader election lost")))
+			},
+			OnNewLeader: func(identity string) {
+				if identity == operatorID {
+					l.Info("Leading the operator HA deployment")
+				} else {
+					l.Info("Leader re-election complete", "newLeader", identity, "operatorID", operatorID)
+				}
+			},
+		},
+	})
+}
+
+// RandomStringWithPrefix returns a random string of length n + len(prefix) with
+// the given prefix, containing upper- and lowercase runes.
+func randomStringWithPrefix(prefix string, n int) (string, error) {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	bytes := make([]byte, n)
+	for i := range bytes {
+		num, err := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
+		if err != nil {
+			return "", fmt.Errorf("failed to generate random number: %w", err)
+		}
+		bytes[i] = letters[num.Int64()]
+	}
+	return prefix + string(bytes), nil
+}

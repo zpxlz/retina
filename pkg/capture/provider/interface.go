@@ -3,14 +3,19 @@
 
 package provider
 
-import "os"
+import (
+	"context"
 
-//go:generate go run github.com/golang/mock/mockgen@v1.6.0 -source=interface.go -destination=mock_network_capture.go -package=provider Interface
+	"github.com/microsoft/retina/pkg/capture/file"
+)
+
+//go:generate go run go.uber.org/mock/mockgen@v0.4.0 -source=interface.go -destination=mock_network_capture.go -package=provider Interface
 type NetworkCaptureProviderInterface interface {
 	// Setup prepares the provider with folder to store network capture for temporary.
-	Setup(captureJobName, nodeHostname string) (string, error)
+	Setup(filename file.CaptureFilename) (string, error)
 	// CaptureNetworkPacket capture network traffic per user input and store the captured network packets in local directory.
-	CaptureNetworkPacket(filter string, duration, maxSize int, sigChan <-chan os.Signal) error
+	// When fileCount > 0, tcpdump uses rotating capture files (-W and -C flags).
+	CaptureNetworkPacket(ctx context.Context, includeExcludeFilter string, duration, maxSize, fileCount int) error
 	// CollectMetadata collects network metadata and store network metadata info in local directory.
 	CollectMetadata() error
 	// Cleanup removes created resources.

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/cilium/cilium/api/v1/flow"
+	"github.com/microsoft/retina/pkg/utils"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -34,7 +35,7 @@ func TestNewCtxOps(t *testing.T) {
 			ctxType: source,
 			expected: []string{
 				"source_ip", "source_namespace", "source_podname",
-				"source_workloadKind", "source_workloadName", "source_service", "source_port",
+				"source_workload_kind", "source_workload_name", "source_service", "source_port",
 			},
 			f:            &flow.Flow{},
 			expectedVals: []string{"unknown", "unknown", "unknown", "unknown", "unknown", "unknown", "unknown"},
@@ -45,7 +46,7 @@ func TestNewCtxOps(t *testing.T) {
 			ctxType: destination,
 			expected: []string{
 				"destination_ip", "destination_namespace", "destination_podname",
-				"destination_workloadKind", "destination_workloadName", "destination_service", "destination_port",
+				"destination_workload_kind", "destination_workload_name", "destination_service", "destination_port",
 			},
 			f:            &flow.Flow{},
 			expectedVals: []string{"unknown", "unknown", "unknown", "unknown", "unknown", "unknown", "unknown"},
@@ -56,7 +57,7 @@ func TestNewCtxOps(t *testing.T) {
 			ctxType: source,
 			expected: []string{
 				"source_ip", "source_namespace", "source_podname",
-				"source_workloadKind", "source_workloadName", "source_service", "source_port",
+				"source_workload_kind", "source_workload_name", "source_service", "source_port",
 			},
 			f: &flow.Flow{
 				Source: &flow.Endpoint{
@@ -72,7 +73,7 @@ func TestNewCtxOps(t *testing.T) {
 			ctxType: destination,
 			expected: []string{
 				"destination_ip", "destination_namespace", "destination_podname",
-				"destination_workloadKind", "destination_workloadName", "destination_service", "destination_port",
+				"destination_workload_kind", "destination_workload_name", "destination_service", "destination_port",
 			},
 			f: &flow.Flow{
 				Destination: &flow.Endpoint{
@@ -130,6 +131,45 @@ func TestNewCtxOps(t *testing.T) {
 			},
 			expectedVals: []string{"", "unknown", "unknown"},
 		},
+		{
+			name:    "source zone option",
+			opts:    []string{"namespace", "zone"},
+			ctxType: source,
+			expected: []string{
+				"source_namespace", "source_zone",
+			},
+			f:            flowWithZones("zone-1", "zone-2"),
+			expectedVals: []string{"unknown", "zone-1"},
+		},
+		{
+			name:    "destination zone option",
+			opts:    []string{"namespace", "zone"},
+			ctxType: destination,
+			expected: []string{
+				"destination_namespace", "destination_zone",
+			},
+			f:            flowWithZones("zone-1", "zone-2"),
+			expectedVals: []string{"unknown", "zone-2"},
+		},
+		{
+			name:         "zone with no extensions",
+			opts:         []string{"zone"},
+			ctxType:      source,
+			expected:     []string{"source_zone"},
+			f:            &flow.Flow{},
+			expectedVals: []string{"unknown"},
+		},
+		{
+			name:     "port option with a non-TCP/UDP flow keeps values aligned with labels",
+			opts:     []string{"ip", "port"},
+			ctxType:  source,
+			expected: []string{"source_ip", "source_port"},
+			f: &flow.Flow{
+				IP: &flow.IP{Source: "10.0.0.1"},
+				L4: &flow.Layer4{Protocol: &flow.Layer4_ICMPv4{ICMPv4: &flow.ICMPv4{}}},
+			},
+			expectedVals: []string{"10.0.0.1", "unknown"},
+		},
 	}
 
 	for _, tc := range tt {
@@ -137,5 +177,38 @@ func TestNewCtxOps(t *testing.T) {
 		assert.Equal(t, tc.expected, c.getLabels(), "labels should match %s", tc.name)
 		values := c.getValues(tc.f)
 		assert.Equal(t, tc.expectedVals, values, "values should match %s", tc.name)
+	}
+}
+
+// flowWithZones creates a flow with zone extensions populated.
+func flowWithZones(srcZone, dstZone string) *flow.Flow {
+	f := &flow.Flow{}
+	ext := utils.NewExtensions()
+	utils.AddZones(ext, srcZone, dstZone)
+	utils.SetExtensions(f, ext)
+	return f
+}
+
+// TestPortContextCardinalityAcrossL4 brute-forces every Layer4 variant in both
+// directions: the value count must equal the label count, or WithLabelValues panics.
+func TestPortContextCardinalityAcrossL4(t *testing.T) {
+	l4s := map[string]*flow.Layer4{
+		"nil":    nil,
+		"tcp":    {Protocol: &flow.Layer4_TCP{TCP: &flow.TCP{}}},
+		"udp":    {Protocol: &flow.Layer4_UDP{UDP: &flow.UDP{}}},
+		"sctp":   {Protocol: &flow.Layer4_SCTP{SCTP: &flow.SCTP{}}},
+		"icmpv4": {Protocol: &flow.Layer4_ICMPv4{ICMPv4: &flow.ICMPv4{}}},
+		"icmpv6": {Protocol: &flow.Layer4_ICMPv6{ICMPv6: &flow.ICMPv6{}}},
+	}
+	for _, ctxType := range []ctxOptionType{source, destination} {
+		c := NewCtxOption([]string{"ip", "port", "namespace"}, ctxType)
+		labels := c.getLabels()
+		for name, l4 := range l4s {
+			f := &flow.Flow{IP: &flow.IP{Source: "10.0.0.1", Destination: "10.0.0.2"}, L4: l4}
+			if values := c.getValues(f); len(values) != len(labels) {
+				t.Errorf("%s/%d: %d values %v vs %d labels %v -> WithLabelValues would panic",
+					name, ctxType, len(values), values, len(labels), labels)
+			}
+		}
 	}
 }

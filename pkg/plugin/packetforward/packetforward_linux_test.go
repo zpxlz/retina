@@ -10,17 +10,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
 
 	kcfg "github.com/microsoft/retina/pkg/config"
 
-	"github.com/golang/mock/gomock"
 	"github.com/microsoft/retina/pkg/log"
 	"github.com/microsoft/retina/pkg/metrics"
 	mocks "github.com/microsoft/retina/pkg/plugin/packetforward/mocks"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -84,7 +85,7 @@ func TestStop(t *testing.T) {
 	log.SetupZapLogger(log.GetDefaultLogOpts())
 	p := &packetForward{
 		cfg: cfgPodLevelEnabled,
-		l:   log.Logger().Named(string(Name)),
+		l:   log.Logger().Named(name),
 	}
 	err := p.Stop()
 	if err != nil {
@@ -112,7 +113,7 @@ func TestStop_NonNilMap(t *testing.T) {
 	mockedMap := mocks.NewMockIMap(ctrl)
 	mockedMap.EXPECT().Close().Return(errors.New("Error")).MinTimes(1)
 	p := &packetForward{
-		l:           log.Logger().Named(string(Name)),
+		l:           log.Logger().Named(name),
 		hashmapData: mockedMap,
 	}
 	err := p.Stop()
@@ -136,7 +137,7 @@ func TestStop_NonNilMap(t *testing.T) {
 func TestCompile(t *testing.T) {
 	log.SetupZapLogger(log.GetDefaultLogOpts())
 	p := &packetForward{
-		l: log.Logger().Named(string(Name)),
+		l: log.Logger().Named(name),
 	}
 	dir, _ := absPath()
 	expectedOutputFile := fmt.Sprintf("%s/%s", dir, bpfObjectFileName)
@@ -163,7 +164,7 @@ func TestShutdown(t *testing.T) {
 			MetricsInterval: 100 * time.Second,
 			EnablePodLevel:  true,
 		},
-		l: log.Logger().Named(string(Name)),
+		l: log.Logger().Named(name),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -181,7 +182,7 @@ func TestShutdown(t *testing.T) {
 
 func TestRun(t *testing.T) {
 	log.SetupZapLogger(log.GetDefaultLogOpts())
-	metrics.InitializeMetrics()
+	metrics.InitializeMetrics(slog.Default())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
@@ -190,7 +191,7 @@ func TestRun(t *testing.T) {
 
 	p := &packetForward{
 		cfg:         cfgPodLevelEnabled,
-		l:           log.Logger().Named(string(Name)),
+		l:           log.Logger().Named(name),
 		hashmapData: mockedMap,
 	}
 
@@ -214,7 +215,7 @@ func TestRun(t *testing.T) {
 
 func TestRun_ReturnError_Ingress(t *testing.T) {
 	log.SetupZapLogger(log.GetDefaultLogOpts())
-	metrics.InitializeMetrics()
+	metrics.InitializeMetrics(slog.Default())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
@@ -223,7 +224,7 @@ func TestRun_ReturnError_Ingress(t *testing.T) {
 
 	p := &packetForward{
 		cfg:         cfgPodLevelEnabled,
-		l:           log.Logger().Named(string(Name)),
+		l:           log.Logger().Named(name),
 		hashmapData: mockedMap,
 	}
 
@@ -247,7 +248,7 @@ func TestRun_ReturnError_Ingress(t *testing.T) {
 
 func TestRun_ReturnError_Egress(t *testing.T) {
 	log.SetupZapLogger(log.GetDefaultLogOpts())
-	metrics.InitializeMetrics()
+	metrics.InitializeMetrics(slog.Default())
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
@@ -257,7 +258,7 @@ func TestRun_ReturnError_Egress(t *testing.T) {
 
 	p := &packetForward{
 		cfg:         cfgPodLevelEnabled,
-		l:           log.Logger().Named(string(Name)),
+		l:           log.Logger().Named(name),
 		hashmapData: mockedMap,
 	}
 

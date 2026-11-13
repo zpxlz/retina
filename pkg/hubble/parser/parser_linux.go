@@ -1,0 +1,106 @@
+package parser
+
+import (
+	"errors"
+	"log/slog"
+
+	"github.com/cilium/cilium/api/v1/flow"
+	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
+	observer "github.com/cilium/cilium/pkg/hubble/observer/types"
+	"github.com/cilium/cilium/pkg/hubble/parser"
+	ipc "github.com/cilium/cilium/pkg/ipcache"
+	"github.com/cilium/hive/cell"
+	"github.com/microsoft/retina/pkg/hubble/common"
+	"github.com/microsoft/retina/pkg/hubble/parser/layer34"
+	"github.com/microsoft/retina/pkg/hubble/parser/seven"
+
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+var (
+	errV1Event        = errors.New("failed to cast agent event to v1.Event")
+	errEnrich         = errors.New("failed to enrich flow")
+	errEmptyPayload   = errors.New("empty payload")
+	errUnknownPayload = errors.New("unknown payload")
+)
+
+type Params struct {
+	cell.In
+
+	Logger            *slog.Logger
+	ServiceReconciler common.SvcDecoder
+	LabelCache        common.LabelCache
+
+	IPCache *ipc.IPCache
+}
+
+type Parser struct {
+	l *slog.Logger
+
+	l34 *layer34.Parser
+	l7  *seven.Parser
+}
+
+func New(params Params) parser.Decoder {
+	logger := params.Logger.With("subsys", "payloadparser")
+	return &Parser{
+		l: logger,
+
+		l34: layer34.New(logger, params.ServiceReconciler, params.IPCache, params.LabelCache),
+		l7:  seven.New(logger, params.ServiceReconciler, params.IPCache, params.LabelCache),
+	}
+}
+
+func (p *Parser) Decode(monitorEvent *observer.MonitorEvent) (*v1.Event, error) {
+	switch monitorEvent.Payload.(type) { //nolint:gocritic
+	case *observer.AgentEvent:
+		payload := monitorEvent.Payload.(*observer.AgentEvent)
+		ev, ok := payload.Message.(*v1.Event)
+		if !ok {
+			return nil, errV1Event
+		}
+		f := p._decode(ev)
+		if f == nil {
+			return nil, errEnrich
+		}
+		ev.Event = f
+		ev.Timestamp = timestamppb.Now()
+		return ev, nil
+	case nil:
+		return nil, errEmptyPayload
+	default:
+		return nil, errUnknownPayload
+	}
+}
+
+func (p *Parser) _decode(event *v1.Event) *flow.Flow {
+	if event == nil {
+		return nil
+	}
+
+	// Enrich the event with the IP address of the source and destination.
+	// This is used to enrich the event with the source and destination
+	// node names.
+	f, ok := event.Event.(*flow.Flow)
+	if !ok {
+		p.l.Warn("Failed to cast event to flow", "event", event.Event)
+		return nil
+	}
+	if f == nil {
+		p.l.Warn("Failed to get flow from event", "event", event)
+		return nil
+	}
+
+	// Decode the flow based on its type.
+	switch f.GetType() { //nolint:exhaustive // We only care about the known types.
+	case flow.FlowType_L3_L4:
+		f = p.l34.Decode(f)
+	case flow.FlowType_L7:
+		f = p.l7.Decode(f)
+	default:
+		p.l.Warn("Unknown flow type", "flow", f)
+	}
+
+	p.l.Debug("Enriched flow", "flow", f)
+	return f
+}

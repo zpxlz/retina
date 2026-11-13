@@ -286,7 +286,7 @@ func (j *Job) validateStep(step *StepWrapper) error {
 
 				var err error
 				var value string
-				if step.Opts.SkipSavingParamatersToJob {
+				if step.Opts.SkipSavingParametersToJob {
 					retrievedvalue := j.GetValues(step, parameter)
 
 					// if the value is already set, and it's not the same as the one we're trying to set, error
@@ -296,7 +296,7 @@ func (j *Job) validateStep(step *StepWrapper) error {
 
 					if passedvalue == "" {
 						if retrievedvalue == "" {
-							return fmt.Errorf("parameter \"%s\" is empty in step \"%s\"; %w", parameter, j.GetPrettyStepName(step), ErrNoValue)
+							return fmt.Errorf("parameter \"%s\" is empty in step \"%s\" and no existing value was saved in job; %w", parameter, j.GetPrettyStepName(step), ErrNoValue)
 						}
 						value = retrievedvalue
 					} else {

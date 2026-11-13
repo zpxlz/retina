@@ -7,14 +7,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path"
+	"reflect"
 	"runtime"
 	"testing"
 	"time"
+	"unsafe"
 
+	"github.com/blang/semver/v4"
 	"github.com/cilium/ebpf/perf"
-	"github.com/golang/mock/gomock"
 	kcfg "github.com/microsoft/retina/pkg/config"
 	"github.com/microsoft/retina/pkg/enricher"
 	"github.com/microsoft/retina/pkg/log"
@@ -22,6 +25,7 @@ import (
 	mocks "github.com/microsoft/retina/pkg/plugin/dropreason/mocks"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -30,6 +34,7 @@ var (
 		MetricsInterval:          1 * time.Second,
 		EnablePodLevel:           true,
 		BypassLookupIPOfInterest: true,
+		DataAggregationLevel:     kcfg.Low,
 	}
 	cfgPodLevelDisabled = &kcfg.Config{
 		MetricsInterval: 1 * time.Second,
@@ -41,7 +46,7 @@ func TestStop(t *testing.T) {
 	log.SetupZapLogger(log.GetDefaultLogOpts())
 	p := &dropReason{
 		cfg: cfgPodLevelEnabled,
-		l:   log.Logger().Named(string(Name)),
+		l:   log.Logger().Named(name),
 	}
 	err := p.Stop()
 	if err != nil {
@@ -68,7 +73,7 @@ func TestShutdown(t *testing.T) {
 			MetricsInterval: 100 * time.Second,
 			EnablePodLevel:  false,
 		},
-		l: log.Logger().Named(string(Name)),
+		l: log.Logger().Named(name),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -91,7 +96,7 @@ func TestCompile(t *testing.T) {
 	log.SetupZapLogger(log.GetDefaultLogOpts())
 	p := &dropReason{
 		cfg: cfgPodLevelEnabled,
-		l:   log.Logger().Named(string(Name)),
+		l:   log.Logger().Named(name),
 	}
 	dir, _ := absPath()
 	expectedOutputFile := fmt.Sprintf("%s/%s", dir, bpfObjectFileName)
@@ -99,6 +104,11 @@ func TestCompile(t *testing.T) {
 	err := os.Remove(expectedOutputFile)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Expected no error. Error: %+v", err)
+	}
+
+	err = p.Generate(context.Background())
+	if err != nil {
+		t.Fatal("Expected no error. Error:", err)
 	}
 
 	err = p.Compile(context.Background())
@@ -112,10 +122,10 @@ func TestCompile(t *testing.T) {
 
 func TestProcessMapValue(t *testing.T) {
 	log.SetupZapLogger(log.GetDefaultLogOpts())
-	metrics.InitializeMetrics()
+	metrics.InitializeMetrics(slog.Default())
 	dr := &dropReason{
 		cfg: cfgPodLevelEnabled,
-		l:   log.Logger().Named(string(Name)),
+		l:   log.Logger().Named(name),
 	}
 
 	testMetricKey := dropMetricKey{DropType: 1, ReturnVal: 2}
@@ -128,11 +138,11 @@ func TestProcessMapValue(t *testing.T) {
 	direction := testMetricKey.getDirection()
 
 	dropCount := &dto.Metric{}
-	err := metrics.DropCounter.WithLabelValues(reason, direction).Write(dropCount)
+	err := metrics.DropPacketsGauge.WithLabelValues(reason, direction).Write(dropCount)
 	require.Nil(t, err, "Expected no error but got: %w", err)
 
 	dropBytes := &dto.Metric{}
-	err = metrics.DropBytesCounter.WithLabelValues(reason, direction).Write(dropBytes)
+	err = metrics.DropBytesGauge.WithLabelValues(reason, direction).Write(dropBytes)
 	require.Nil(t, err, "Expected no error but got: %w", err)
 
 	dropCountValue := *dropCount.Gauge.Value
@@ -160,7 +170,7 @@ func TestDropReasonRun_Error(t *testing.T) {
 	// Create drop reason instance
 	dr := &dropReason{
 		cfg:            cfgPodLevelDisabled,
-		l:              log.Logger().Named(string(Name)),
+		l:              log.Logger().Named(name),
 		metricsMapData: mockedMap,
 	}
 
@@ -170,11 +180,10 @@ func TestDropReasonRun_Error(t *testing.T) {
 	// Create a context with a short timeout for testing purposes
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 
+	errCh := make(chan error, 1)
 	// Start the drop reason routine in a goroutine
 	go func() {
-		if err := dr.run(ctx); err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		errCh <- dr.run(ctx)
 	}()
 
 	// Wait for a short period of time for the routine to start
@@ -182,6 +191,9 @@ func TestDropReasonRun_Error(t *testing.T) {
 
 	cancel()
 	ticker.Stop()
+	if err := <-errCh; err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func TestDropReasonRun(t *testing.T) {
@@ -201,9 +213,16 @@ func TestDropReasonRun(t *testing.T) {
 	mockedMapIterator.EXPECT().Err().Return(nil).MinTimes(1)
 	mockedMapIterator.EXPECT().Next(gomock.Any(), gomock.Any()).Return(false).MinTimes(1)
 
+	// create a rawSample slice and fill it with `unsafe.Sizeof(kprobePacket{})`
+	rawSample := make([]byte, unsafe.Sizeof(kprobePacket{}))
+	for i := range rawSample {
+		rawSample[i] = byte(i)
+	}
+
+	// TODO(nddq) : test an actual kprobePacket similar to what we are doing with packetparserPacket in packetparser
 	mockedPerfRecord := perf.Record{
 		CPU:         0,
-		RawSample:   []byte{0x01, 0x02, 0x03},
+		RawSample:   rawSample,
 		LostSamples: 0,
 	}
 	mockedPerfReader.EXPECT().Read().Return(mockedPerfRecord, nil).MinTimes(1)
@@ -211,7 +230,7 @@ func TestDropReasonRun(t *testing.T) {
 	// Create drop reason instance
 	dr := &dropReason{
 		cfg:            cfgPodLevelEnabled,
-		l:              log.Logger().Named(string(Name)),
+		l:              log.Logger().Named(name),
 		metricsMapData: mockedMap,
 		reader:         mockedPerfReader,
 		enricher:       menricher,
@@ -225,11 +244,10 @@ func TestDropReasonRun(t *testing.T) {
 	// create a ticker with a short interval for testing purposes
 	ticker := time.NewTicker(2 * time.Second)
 
+	errCh := make(chan error, 1)
 	// Start the drop reason routine in a goroutine
 	go func() {
-		if err := dr.run(ctx); err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		errCh <- dr.run(ctx)
 	}()
 
 	// Wait for a short period of time for the routine to start
@@ -237,6 +255,9 @@ func TestDropReasonRun(t *testing.T) {
 
 	cancel()
 	ticker.Stop()
+	if err := <-errCh; err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func TestDropReasonReadDataPodLevelEnabled(t *testing.T) {
@@ -248,19 +269,25 @@ func TestDropReasonReadDataPodLevelEnabled(t *testing.T) {
 	mockedPerfReader := mocks.NewMockIPerfReader(ctrl)
 	menricher := enricher.NewMockEnricherInterface(ctrl) //nolint:typecheck
 
-	// mock perf reader record
+	// create a rawSample slice and fill it with `unsafe.Sizeof(kprobePacket{})`
+	rawSample := make([]byte, unsafe.Sizeof(kprobePacket{}))
+	for i := range rawSample {
+		rawSample[i] = byte(i)
+	}
+
 	mockedPerfRecord := perf.Record{
 		CPU:         0,
-		RawSample:   []byte{0x01, 0x02, 0x03},
+		RawSample:   rawSample,
 		LostSamples: 0,
 	}
+
 	mockedPerfReader.EXPECT().Read().Return(mockedPerfRecord, nil).MinTimes(1)
 	menricher.EXPECT().Write(gomock.Any()).MinTimes(1)
 
 	// Create drop reason instance
 	dr := &dropReason{
 		cfg:            cfgPodLevelEnabled,
-		l:              log.Logger().Named(string(Name)),
+		l:              log.Logger().Named(name),
 		metricsMapData: mockedMap,
 		reader:         mockedPerfReader,
 		enricher:       menricher,
@@ -276,8 +303,8 @@ func TestDropReasonReadDataPodLevelEnabled(t *testing.T) {
 		dr.readEventArrayData()
 	}()
 
+	dr.wg.Add(1)
 	go func() {
-		dr.wg.Add(1)
 		dr.processRecord(ctx, 0)
 	}()
 
@@ -305,7 +332,7 @@ func TestDropReasonReadData_WithEmptyPerfArray(t *testing.T) {
 	// Create drop reason instance
 	dr := &dropReason{
 		cfg:            cfgPodLevelEnabled,
-		l:              log.Logger().Named(string(Name)),
+		l:              log.Logger().Named(name),
 		metricsMapData: mockedMap,
 		reader:         mockedPerfReader,
 	}
@@ -331,10 +358,15 @@ func TestDropReasonReadData_WithPerfArrayLostSamples(t *testing.T) {
 	mockedMap := mocks.NewMockIMap(ctrl)
 	mockedPerfReader := mocks.NewMockIPerfReader(ctrl)
 
-	// mock perf reader record
+	// create a rawSample slice and fill it with `unsafe.Sizeof(kprobePacket{})`
+	rawSample := make([]byte, unsafe.Sizeof(kprobePacket{}))
+	for i := range rawSample {
+		rawSample[i] = byte(i)
+	}
+
 	mockedPerfRecord := perf.Record{
 		CPU:         0,
-		RawSample:   []byte{0x01, 0x02, 0x03},
+		RawSample:   rawSample,
 		LostSamples: 3,
 	}
 	mockedPerfReader.EXPECT().Read().Return(mockedPerfRecord, nil).MinTimes(1)
@@ -342,7 +374,7 @@ func TestDropReasonReadData_WithPerfArrayLostSamples(t *testing.T) {
 	// Create drop reason instance
 	dr := &dropReason{
 		cfg:            cfgPodLevelEnabled,
-		l:              log.Logger().Named(string(Name)),
+		l:              log.Logger().Named(name),
 		metricsMapData: mockedMap,
 		reader:         mockedPerfReader,
 	}
@@ -368,10 +400,15 @@ func TestDropReasonReadData_WithUnknownError(t *testing.T) {
 	mockedMap := mocks.NewMockIMap(ctrl)
 	mockedPerfReader := mocks.NewMockIPerfReader(ctrl)
 
-	// mock perf reader record
+	// create a rawSample slice and fill it with `unsafe.Sizeof(kprobePacket{})`
+	rawSample := make([]byte, unsafe.Sizeof(kprobePacket{}))
+	for i := range rawSample {
+		rawSample[i] = byte(i)
+	}
+
 	mockedPerfRecord := perf.Record{
 		CPU:         0,
-		RawSample:   []byte{0x01, 0x02, 0x03},
+		RawSample:   rawSample,
 		LostSamples: 3,
 	}
 	mockedPerfReader.EXPECT().Read().Return(mockedPerfRecord, errors.New("Unknown Error")).MinTimes(1)
@@ -379,7 +416,7 @@ func TestDropReasonReadData_WithUnknownError(t *testing.T) {
 	// Create drop reason instance
 	dr := &dropReason{
 		cfg:            cfgPodLevelEnabled,
-		l:              log.Logger().Named(string(Name)),
+		l:              log.Logger().Named(name),
 		metricsMapData: mockedMap,
 		reader:         mockedPerfReader,
 	}
@@ -413,7 +450,7 @@ func TestDropReasonGenerate(t *testing.T) {
 	// Instantiate the dropReason struct with a mocked logger and context.
 	dr := &dropReason{
 		cfg: cfgPodLevelEnabled,
-		l:   log.Logger().Named(string(Name)),
+		l:   log.Logger().Named(name),
 	}
 	ctx := context.Background()
 
@@ -434,6 +471,122 @@ func TestDropReasonGenerate(t *testing.T) {
 	}
 	if string(actualContents) != expectedContents {
 		t.Errorf("unexpected dynamic header file contents: got %q, want %q", string(actualContents), expectedContents)
+	}
+}
+
+func mustVersion(v string) semver.Version {
+	ver, err := semver.Parse(v)
+	if err != nil {
+		panic(err)
+	}
+	return ver
+}
+
+func TestResolveEbpfPayload(t *testing.T) {
+	tests := []struct {
+		name              string
+		arch              string
+		kv                semver.Version
+		isMariner         bool
+		isPodLevel        bool
+		ftraceEnabled     bool
+		wantType          string
+		wantSupportsFexit bool
+	}{
+		{
+			name:              "old kernel - fallback to allKprobeObjects",
+			arch:              "amd64",
+			kv:                mustVersion("5.4.0"),
+			isMariner:         false,
+			isPodLevel:        false,
+			ftraceEnabled:     true,
+			wantType:          "*dropreason.allKprobeObjects",
+			wantSupportsFexit: false,
+		},
+		{
+			name:              "new kernel - fexitObjects for Ubuntu",
+			arch:              "amd64",
+			kv:                mustVersion("5.10.0"),
+			isMariner:         false,
+			isPodLevel:        false,
+			ftraceEnabled:     true,
+			wantType:          "*dropreason.allFexitObjects",
+			wantSupportsFexit: true,
+		},
+		{
+			name:              "new kernel - marinerObjects for Mariner",
+			arch:              "amd64",
+			kv:                mustVersion("5.10.0"),
+			isMariner:         true,
+			isPodLevel:        false,
+			ftraceEnabled:     true,
+			wantType:          "*dropreason.marinerObjects",
+			wantSupportsFexit: true,
+		},
+		{
+			name:              "arm64 old kernel - fallback to allKprobeObjects",
+			arch:              "arm64",
+			kv:                mustVersion("5.8.0"),
+			isMariner:         true,
+			isPodLevel:        false,
+			ftraceEnabled:     true,
+			wantType:          "*dropreason.allKprobeObjects",
+			wantSupportsFexit: false,
+		},
+		{
+			name:              "arm64 new kernel - marinerObjects",
+			arch:              "arm64",
+			kv:                mustVersion("6.1.0"),
+			isMariner:         true,
+			isPodLevel:        false,
+			ftraceEnabled:     true,
+			wantType:          "*dropreason.marinerObjects",
+			wantSupportsFexit: true,
+		},
+		{
+			name:              "pod level - use allKprobeObjects",
+			arch:              "amd64",
+			kv:                mustVersion("5.15.0"),
+			isMariner:         false,
+			isPodLevel:        true,
+			ftraceEnabled:     true,
+			wantType:          "*dropreason.allKprobeObjects",
+			wantSupportsFexit: false,
+		},
+		{
+			name:              "mariner with ftrace disabled - fallback to kprobes",
+			arch:              "amd64",
+			kv:                mustVersion("5.15.0"),
+			isMariner:         true,
+			isPodLevel:        false,
+			ftraceEnabled:     false,
+			wantType:          "*dropreason.allKprobeObjects",
+			wantSupportsFexit: false,
+		},
+		{
+			name:              "ubuntu with ftrace disabled - fallback to kprobes",
+			arch:              "amd64",
+			kv:                mustVersion("6.6.0"),
+			isMariner:         false,
+			isPodLevel:        false,
+			ftraceEnabled:     false,
+			wantType:          "*dropreason.allKprobeObjects",
+			wantSupportsFexit: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			objs, _, isFexit := resolvePayload(tt.arch, tt.kv, tt.isMariner, tt.isPodLevel, tt.ftraceEnabled)
+
+			if isFexit != tt.wantSupportsFexit {
+				t.Errorf("isFexit = %v, want %v", isFexit, tt.wantSupportsFexit)
+			}
+
+			if gotType := reflect.TypeOf(objs).String(); gotType != tt.wantType {
+				t.Errorf("object type = %v, want %v", gotType, tt.wantType)
+			}
+		})
 	}
 }
 

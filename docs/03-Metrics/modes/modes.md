@@ -1,0 +1,38 @@
+---
+sidebar_position: 2
+---
+# Standard Metric Modes
+
+Retina provides **three modes** with their own metrics and scale capabilities.
+Each mode is **fully customizable** (only create the metrics/labels you need).
+
+Note that below, "metric cardinality" refers to the number of time series (metric values with a unique set of labels).
+The larger the cardinality, the more load induced on a Prometheus server for instance.
+
+## Quick Comparison
+
+| Feature | Basic Mode | Advanced Mode | Hubble Control Plane |
+|---------|:----------:|:-------------:|:--------------------:|
+| Drop metrics (`drop_count`, `drop_bytes`) | ✅ | ✅ | ✅ |
+| Pod-level attribution | ❌ | ✅ (`adv_*` metrics) | ✅ (`hubble_*` metrics) |
+| API server latency metrics | ❌ | ✅ | ❌ |
+| Flow processing metrics | ❌ | ❌ | ✅ |
+| Operator required | ❌ | ✅ | ✅ |
+
+> **Note:** `drop_bytes` is only emitted on Linux (Windows supports `drop_count` only).
+
+## Mode Details
+
+| Mode                                     | Description                                                                                                                                                                                                                        | Scale                                                                                                                                 | Metrics                          | Configuration                                                                                                |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| *Basic*                                  | Metrics aggregated by Node.                                                                                                                                                                                                        | Metric cardinality proportional to number of nodes.                                                                                   | [Link to Metrics](./basic.md)    | [Link to Installation](../../02-Installation/01-Setup.md#basic-mode)                                                  |
+| *Advanced/Pod-Level with remote context* | Basic metrics plus extra metrics aggregated by source and destination Pod. | Has scale limitations. Metric cardinality is unbounded (proportional to number of source/destination pairs, including external IPs).  | [Link to Metrics](./advanced.md) | [Link to Installation](../../02-Installation/01-Setup.md#advanced-mode-with-local-context) |
+| *Advanced/Pod-Level with local context*  | Basic metrics plus extra metrics aggregated by "local" Pod (source for outgoing traffic, destination for incoming traffic). | Designed for scale. Metric cardinality proportional to number of Pods observed.                                                       | [Link to Metrics](./advanced.md) | [Link to Installation](../../02-Installation/01-Setup.md#advanced-mode-with-local-context)  |
+
+Both advanced metric modes let you specify which Pods to observe (create metrics for) by using [Annotations](../annotations.md) or [MetricsConfiguration CRD](../configuration.md).
+
+## Where Do Metrics Come From?
+
+A Retina agent generates metrics on each Node.
+The Linux agent inserts eBPF programs and gathers data from Linux utilities.
+The Windows agent gathers data from HNS and VFP.

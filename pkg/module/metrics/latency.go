@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/cilium/cilium/api/v1/flow"
-	v1 "github.com/cilium/cilium/api/v1/flow"
 	ttlcache "github.com/jellydator/ttlcache/v3"
 	api "github.com/microsoft/retina/crd/api/v1alpha1"
 	"github.com/microsoft/retina/pkg/common"
@@ -34,10 +33,11 @@ const (
 	apiServerHandshakeLatencyDesc                 = "Latency of node apiserver tcp handshake in ms"
 	TTL                             time.Duration = 500 * time.Millisecond
 	LIMIT                           uint64        = 100000
-	// Bucket size.
-	start = 0
-	width = 0.5
-	count = 10
+	// Histogram bucket parameters (units: milliseconds).
+	// Produces buckets: 0.5, 1.5, 2.5, ..., 63.5, +Inf.
+	start = 0.5
+	width = 1
+	count = 64
 )
 
 type key struct {
@@ -64,9 +64,9 @@ type LatencyMetrics struct {
 	l                             *log.ZapLogger
 	apiServerIps                  map[string]struct{}
 	cache                         *ttlcache.Cache[key, *val]
-	nodeApiServerLatency          metricsinit.IHistogramVec
-	nodeApiServerHandshakeLatency metricsinit.IHistogramVec
-	noResponseMetric              metricsinit.ICounterVec
+	nodeAPIServerLatency          metricsinit.Histogram
+	nodeAPIServerHandshakeLatency metricsinit.Histogram
+	noResponseMetric              metricsinit.CounterVec
 	callbackId                    string
 	mu                            sync.RWMutex
 }
@@ -84,8 +84,8 @@ func NewLatencyMetrics(ctxOptions *api.MetricsContextOptions, fl *log.ZapLogger,
 	}
 
 	switch ctxOptions.MetricName {
-	case utils.NodeApiServerLatencyName:
-		lm.nodeApiServerLatency = exporter.CreatePrometheusHistogramWithLinearBucketsForMetric(
+	case utils.NodeAPIServerLatencyName:
+		lm.nodeAPIServerLatency = exporter.CreatePrometheusHistogramWithLinearBucketsForMetric(
 			exporter.AdvancedRegistry,
 			apiserverLatencyName,
 			apiserverLatencyDesc,
@@ -93,8 +93,8 @@ func NewLatencyMetrics(ctxOptions *api.MetricsContextOptions, fl *log.ZapLogger,
 			width,
 			count,
 		)
-	case utils.NodeApiServerTcpHandshakeLatencyName:
-		lm.nodeApiServerHandshakeLatency = exporter.CreatePrometheusHistogramWithLinearBucketsForMetric(
+	case utils.NodeAPIServerTCPHandshakeLatencyName:
+		lm.nodeAPIServerHandshakeLatency = exporter.CreatePrometheusHistogramWithLinearBucketsForMetric(
 			exporter.AdvancedRegistry,
 			apiServerHandshakeLatencyName,
 			apiServerHandshakeLatencyDesc,
@@ -102,12 +102,12 @@ func NewLatencyMetrics(ctxOptions *api.MetricsContextOptions, fl *log.ZapLogger,
 			width,
 			count,
 		)
-	case utils.NoResponseFromApiServerName:
+	case utils.NoResponseFromAPIServerName:
 		lm.noResponseMetric = exporter.CreatePrometheusCounterVecForMetric(
 			exporter.AdvancedRegistry,
 			noResponseFromNodeAPIServerName,
 			noResponseFromNodeAPIServerDesc,
-			"count",
+			"no_response",
 		)
 	}
 
@@ -124,10 +124,18 @@ func (lm *LatencyMetrics) Init(metricName string) {
 	lm.cache.OnEviction(func(ctx context.Context, reason ttlcache.EvictionReason, item *ttlcache.Item[key, *val]) {
 		if reason == ttlcache.EvictionReasonExpired {
 			// Didn't get the corresponding packet.
-			lm.l.Debug("Evicted item", zap.Any("item", item))
+			k := item.Key()
+			v := item.Value()
+			lm.l.Debug("Evicted item",
+				zap.String("srcIP", k.srcIP),
+				zap.String("dstIP", k.dstIP),
+				zap.Uint32("srcPort", k.srcP),
+				zap.Uint32("dstPort", k.dstP),
+				zap.Uint64("id", k.id),
+				zap.Int32("timestamp", v.t))
 			if lm.noResponseMetric != nil {
 				lm.noResponseMetric.WithLabelValues("no_response").Inc()
-				lm.l.Debug("Incremented no response metric", zap.Any("metric", lm.noResponseMetric))
+				lm.l.Debug("Incremented no response metric", zap.String("metric", noResponseFromNodeAPIServerName))
 			}
 		}
 	})
@@ -151,11 +159,11 @@ func (lm *LatencyMetrics) Init(metricName string) {
 }
 
 func (lm *LatencyMetrics) Clean() {
-	if lm.nodeApiServerLatency != nil {
-		exporter.UnregisterMetric(exporter.AdvancedRegistry, metricsinit.ToPrometheusType(lm.nodeApiServerLatency))
+	if lm.nodeAPIServerLatency != nil {
+		exporter.UnregisterMetric(exporter.AdvancedRegistry, metricsinit.ToPrometheusType(lm.nodeAPIServerLatency))
 	}
-	if lm.nodeApiServerLatency != nil {
-		exporter.UnregisterMetric(exporter.AdvancedRegistry, metricsinit.ToPrometheusType(lm.nodeApiServerHandshakeLatency))
+	if lm.nodeAPIServerLatency != nil {
+		exporter.UnregisterMetric(exporter.AdvancedRegistry, metricsinit.ToPrometheusType(lm.nodeAPIServerHandshakeLatency))
 	}
 	if lm.noResponseMetric != nil {
 		exporter.UnregisterMetric(exporter.AdvancedRegistry, metricsinit.ToPrometheusType(lm.noResponseMetric))
@@ -178,8 +186,8 @@ func (lm *LatencyMetrics) Clean() {
 	}
 }
 
-func (lm *LatencyMetrics) ProcessFlow(f *v1.Flow) {
-	if f == nil || f.L4 == nil || f.L4.GetTCP() == nil || utils.GetTcpID(f) == 0 || f.IP == nil {
+func (lm *LatencyMetrics) ProcessFlow(f *flow.Flow) {
+	if f == nil || f.GetL4() == nil || f.GetL4().GetTCP() == nil || utils.GetTCPID(f) == 0 || f.GetIP() == nil {
 		return
 	}
 
@@ -255,49 +263,49 @@ func (lm *LatencyMetrics) ProcessFlow(f *v1.Flow) {
 |                                                 |
 +-------------------------------------------------+
 */
-func (lm *LatencyMetrics) calculateLatency(f *v1.Flow) {
+func (lm *LatencyMetrics) calculateLatency(f *flow.Flow) {
 	// Ignore all packets observed at endpoint.
 	// We only care about node-apiserver packets observed at eth0.
 	// TO_NETWORK: Packets leaving node via eth0.
 	// FROM_NETWORK: Packets entering node via eth0.
-	if f.TraceObservationPoint == v1.TraceObservationPoint_TO_NETWORK {
+	if f.GetTraceObservationPoint() == flow.TraceObservationPoint_TO_NETWORK {
 		k := key{
 			srcIP: f.IP.Source,
 			dstIP: f.IP.Destination,
-			srcP:  f.L4.GetTCP().SourcePort,
-			dstP:  f.L4.GetTCP().DestinationPort,
-			id:    utils.GetTcpID(f),
+			srcP:  f.GetL4().GetTCP().GetSourcePort(),
+			dstP:  f.GetL4().GetTCP().GetDestinationPort(),
+			id:    utils.GetTCPID(f),
 		}
 		// There will be multiple identical packets with same ID. Store only the first one.
 		if item := lm.cache.Get(k); item == nil {
 			lm.cache.Set(k, &val{
 				t:     f.Time.Nanos,
-				flags: f.L4.GetTCP().Flags,
+				flags: f.GetL4().GetTCP().GetFlags(),
 			}, TTL)
 		}
-	} else if f.TraceObservationPoint == v1.TraceObservationPoint_FROM_NETWORK {
+	} else if f.GetTraceObservationPoint() == flow.TraceObservationPoint_FROM_NETWORK {
 		k := key{
 			srcIP: f.IP.Destination,
 			dstIP: f.IP.Source,
-			srcP:  f.L4.GetTCP().DestinationPort,
-			dstP:  f.L4.GetTCP().SourcePort,
-			id:    utils.GetTcpID(f),
+			srcP:  f.GetL4().GetTCP().GetDestinationPort(),
+			dstP:  f.GetL4().GetTCP().GetSourcePort(),
+			id:    utils.GetTCPID(f),
 		}
 		if item := lm.cache.Get(k); item != nil {
 			// Calculate latency in milliseconds.
 			latency := math.Round(float64(f.Time.Nanos-item.Value().t) / float64(1000000))
 
 			// Log continuous latency.
-			if lm.nodeApiServerLatency != nil {
-				lm.nodeApiServerLatency.Observe(latency)
+			if lm.nodeAPIServerLatency != nil {
+				lm.nodeAPIServerLatency.Observe(latency)
 			}
 
 			// Determine if this is the first reply packet, and if so, log handshake latency.
 			prevFlowflags := item.Value().flags
 			curFlowflags := f.L4.GetTCP().Flags
-			if lm.nodeApiServerHandshakeLatency != nil && prevFlowflags != nil && prevFlowflags.SYN && curFlowflags != nil && curFlowflags.SYN && curFlowflags.ACK {
+			if lm.nodeAPIServerHandshakeLatency != nil && prevFlowflags != nil && prevFlowflags.GetSYN() && curFlowflags != nil && curFlowflags.GetSYN() && curFlowflags.GetACK() {
 				// This is the first reply packet.
-				lm.nodeApiServerHandshakeLatency.Observe(latency)
+				lm.nodeAPIServerHandshakeLatency.Observe(latency)
 			}
 			// Delete the entry from cache. Calculate latency for the first reply packet only.
 			lm.cache.Delete(k)
@@ -324,25 +332,33 @@ func (lm *LatencyMetrics) apiserverWatcherCallbackFn(obj interface{}) {
 
 	switch event.Type {
 	case cc.EventTypeAddAPIServerIPs:
-		lm.l.Debug("Add apiserver ips", zap.Any("ips", apiServerIPs))
-		lm.addIps(apiServerIPs)
+		ipStrings := lm.addIps(apiServerIPs)
+		lm.l.Debug("Add apiserver ips", zap.Strings("ips", ipStrings))
 	case cc.EventTypeDeleteAPIServerIPs:
-		lm.l.Debug("Delete apiserver ips", zap.Any("ips", apiServerIPs))
-		lm.removeIps(apiServerIPs)
+		ipStrings := lm.removeIps(apiServerIPs)
+		lm.l.Debug("Delete apiserver ips", zap.Strings("ips", ipStrings))
 
 	default:
-		lm.l.Debug("Unknown event type", zap.Any("event", event))
+		lm.l.Debug("Unknown event type", zap.String("eventType", event.Type.String()))
 	}
 }
 
-func (lm *LatencyMetrics) addIps(ips []net.IP) {
-	for _, ip := range ips {
-		lm.apiServerIps[ip.String()] = struct{}{}
+func (lm *LatencyMetrics) addIps(ips []net.IP) []string {
+	ipStrings := make([]string, len(ips))
+	for i, ip := range ips {
+		ipString := ip.String()
+		ipStrings[i] = ipString
+		lm.apiServerIps[ipString] = struct{}{}
 	}
+	return ipStrings
 }
 
-func (lm *LatencyMetrics) removeIps(ips []net.IP) {
-	for _, ip := range ips {
-		delete(lm.apiServerIps, ip.String())
+func (lm *LatencyMetrics) removeIps(ips []net.IP) []string {
+	ipStrings := make([]string, len(ips))
+	for i, ip := range ips {
+		ipString := ip.String()
+		ipStrings[i] = ipString
+		delete(lm.apiServerIps, ipString)
 	}
+	return ipStrings
 }

@@ -3,16 +3,17 @@
 package metrics
 
 import (
-	"github.com/cilium/cilium/api/v1/flow"
-	"github.com/microsoft/retina/pkg/log"
+	"log/slog"
+
 	"github.com/prometheus/client_golang/prometheus"
-	"go.uber.org/zap"
 )
 
 const (
 	// Control plane metrics
 	pluginManagerFailedToReconcileCounterName = "plugin_manager_failed_to_reconcile"
 	lostEventsCounterName                     = "lost_events_counter"
+	parsedPacketsCounterName                  = "parsed_packets_counter"
+	expiredMetricsCounterName                 = "expired_metrics_counter"
 
 	// Windows
 	hnsStats            = "windows_hns_stats"
@@ -22,27 +23,37 @@ const (
 	nodeApiServerHandshakeLatencyHistName = "node_apiserver_handshake_latency_ms"
 
 	// Metric Descriptions
-	dropCountTotalDescription                 = "Total dropped packets"
-	dropBytesTotalDescription                 = "Total dropped bytes"
-	forwardCountTotalDescription              = "Total forwarded packets"
-	forwardBytesTotalDescription              = "Total forwarded bytes"
-	nodeConnectivityStatusDescription         = "The last observed status of both ICMP and HTTP connectivity between the current Cilium agent and other Cilium nodes"
-	nodeConnectivityLatencySecondsDescription = "The last observed latency between the current Cilium agent and other Cilium nodes in seconds"
-	tcpStateGaugeDescription                  = "number of active TCP connections by state"
-	tcpConnectionRemoteGaugeDescription       = "number of active TCP connections by remote address"
-	tcpConnectionStatsDescription             = "TCP connections Statistics"
-	tcpFlagCountersDescription                = "TCP counters by flag"
-	ipConnectionStatsDescription              = "IP connections Statistics"
-	udpConnectionStatsDescription             = "UDP connections Statistics"
-	udpActiveSocketsCounterDescription        = "number of active UDP sockets"
-	interfaceStatsDescription                 = "Interface Statistics"
-	nodeApiServerHandshakeLatencyDesc         = "Histogram depicting latency of the TCP handshake between nodes and Kubernetes API server measured in milliseconds"
-	dnsRequestCounterDescription              = "DNS requests by statistics"
-	dnsResponseCounterDescription             = "DNS responses by statistics"
+	dropPacketsGaugeDescription                    = "Total dropped packets"
+	dropBytesGaugeDescription                      = "Total dropped bytes"
+	forwardPacketsGaugeDescription                 = "Total forwarded packets"
+	forwardBytesGaugeDescription                   = "Total forwarded bytes"
+	nodeConnectivityStatusGaugeDescription         = "The last observed status of both ICMP and HTTP connectivity between the current Cilium agent and other Cilium nodes"
+	nodeConnectivityLatencySecondsGaugeDescription = "The last observed latency between the current Cilium agent and other Cilium nodes in seconds"
+	tcpStateGaugeDescription                       = "Number of active TCP connections by state"
+	tcpConnectionRemoteGaugeDescription            = "Number of active TCP connections by remote address"
+	tcpConnectionStatsGaugeDescription             = "TCP connections statistics"
+	tcpFlagGaugeDescription                        = "TCP gauges by flag"
+	ipConnectionStatsGaugeDescription              = "IP connections statistics"
+	udpConnectionStatsGaugeDescription             = "UDP connections statistics"
+	interfaceStatsGaugeDescription                 = "Interface statistics"
+	nodeAPIServerHandshakeLatencyDesc              = "Histogram depicting latency of the TCP handshake between nodes and Kubernetes API server measured in milliseconds"
+	dnsRequestCounterDescription                   = "DNS requests by statistics"
+	dnsResponseCounterDescription                  = "DNS responses by statistics"
+	infinibandStatsGaugeDescription                = "InfiniBand statistics gauge"
+	infinibandStatusParamsGaugeDescription         = "InfiniBand Status Parameters gauge"
 
 	// Control plane metrics
 	pluginManagerFailedToReconcileCounterDescription = "Number of times the plugin manager failed to reconcile the plugins"
 	lostEventsCounterDescription                     = "Number of events lost in control plane"
+	parsedPacketsCounterDescription                  = "Number of packets parsed by the packetparser plugin"
+	expiredMetricsCounterDescription                 = "Number of metrics expired due to lack of updates and no longer exported"
+
+	// Conntrack metrics
+	ConntrackPacketTxDescription         = "Number of tx packets"
+	ConntrackPacketRxDescription         = "Number of rx packets"
+	ConntrackBytesTxDescription          = "Number of tx bytes"
+	ConntrackBytesRxDescription          = "Number of rx bytes"
+	ConntrackTotalConnectionsDescription = "Total number of connections"
 )
 
 // Metric Counters
@@ -50,43 +61,55 @@ var (
 	// Prevent re-initialization
 	isInitialized bool
 
-	// Common counters across os distributions
-	DropCounter         IGaugeVec
-	DropBytesCounter    IGaugeVec
-	ForwardCounter      IGaugeVec
-	ForwardBytesCounter IGaugeVec
+	// Common gauges across os distributions
+	DropPacketsGauge    GaugeVec
+	DropBytesGauge      GaugeVec
+	ForwardPacketsGauge GaugeVec
+	ForwardBytesGauge   GaugeVec
 
-	WindowsCounter IGaugeVec
+	// Windows
+	HNSStatsGauge GaugeVec
 
 	// Common gauges across os distributions
-	NodeConnectivityStatusGauge  IGaugeVec
-	NodeConnectivityLatencyGauge IGaugeVec
+	NodeConnectivityStatusGauge  GaugeVec
+	NodeConnectivityLatencyGauge GaugeVec
 
 	// TCP Stats
-	TCPStateGauge            IGaugeVec
-	TCPConnectionRemoteGauge IGaugeVec
-	TCPConnectionStats       IGaugeVec
-	TCPFlagCounters          IGaugeVec
+	TCPStateGauge            GaugeVec
+	TCPConnectionRemoteGauge GaugeVec
+	TCPConnectionStatsGauge  GaugeVec
+	TCPFlagGauge             GaugeVec
 
 	// IP States
-	IPConnectionStats IGaugeVec
+	IPConnectionStatsGauge GaugeVec
 
 	// UDP Stats
-	UDPConnectionStats      IGaugeVec
-	UDPActiveSocketsCounter IGaugeVec
+	UDPConnectionStatsGauge GaugeVec
 
 	// Interface Stats
-	InterfaceStats IGaugeVec
+	InterfaceStatsGauge GaugeVec
 
-	metricsLogger *log.ZapLogger
+	metricsLogger *slog.Logger
 
 	// Control Plane Metrics
-	PluginManagerFailedToReconcileCounter ICounterVec
-	LostEventsCounter                     ICounterVec
+	PluginManagerFailedToReconcileCounter CounterVec
+	LostEventsCounter                     CounterVec
+	ParsedPacketsCounter                  CounterVec
+	MetricsExpiredCounter                 CounterVec
 
 	// DNS Metrics.
-	DNSRequestCounter  ICounterVec
-	DNSResponseCounter ICounterVec
+	DNSRequestCounter  CounterVec
+	DNSResponseCounter CounterVec
+
+	InfinibandStatsGauge        GaugeVec
+	InfinibandStatusParamsGauge GaugeVec
+
+	// Conntrack
+	ConntrackPacketsTx        GaugeVec
+	ConntrackPacketsRx        GaugeVec
+	ConntrackBytesTx          GaugeVec
+	ConntrackBytesRx          GaugeVec
+	ConntrackTotalConnections GaugeVec
 )
 
 func ToPrometheusType(metric interface{}) prometheus.Collector {
@@ -94,70 +117,16 @@ func ToPrometheusType(metric interface{}) prometheus.Collector {
 		return nil
 	}
 	switch m := metric.(type) {
-	case IGaugeVec:
+	case GaugeVec:
 		return m.(*prometheus.GaugeVec)
-	case ICounterVec:
+	case CounterVec:
 		return m.(*prometheus.CounterVec)
-	case IHistogramVec:
-		return m.(prometheus.Histogram)
 	default:
-		metricsLogger.Error("error converting unknown metric type", zap.Any("metric", m))
+		if metricsLogger != nil {
+			metricsLogger.Error("error converting unknown metric type", slog.Any("metric", m))
+		}
 		return nil
 	}
 }
 
 type DropReasonType uint32
-
-// Alert: this ordering should match the drop_reason_t enum ordering
-// in dropreason.h of DropReason plugin
-const (
-	IPTABLE_RULE_DROP DropReasonType = iota
-	IPTABLE_NAT_DROP
-	TCP_CONNECT_BASIC
-	TCP_ACCEPT_BASIC
-	TCP_CLOSE_BASIC
-	CONNTRACK_ADD_DROP
-	UNKNOWN_DROP
-)
-
-func GetDropType(value uint32) DropReasonType {
-	switch value {
-	case 0:
-		return IPTABLE_RULE_DROP
-	case 1:
-		return IPTABLE_NAT_DROP
-	case 2:
-		return TCP_CONNECT_BASIC
-	case 3:
-		return TCP_ACCEPT_BASIC
-	case 4:
-		return TCP_CLOSE_BASIC
-	case 5:
-		return CONNTRACK_ADD_DROP
-	default:
-		return UNKNOWN_DROP
-	}
-}
-
-func GetDropTypeFlowDropReason(dr flow.DropReason) DropReasonType {
-	return GetDropType(uint32(dr))
-}
-
-func (d DropReasonType) String() string {
-	switch d {
-	case IPTABLE_RULE_DROP:
-		return "IPTABLE_RULE_DROP"
-	case IPTABLE_NAT_DROP:
-		return "IPTABLE_NAT_DROP"
-	case TCP_CONNECT_BASIC:
-		return "TCP_CONNECT_BASIC"
-	case TCP_ACCEPT_BASIC:
-		return "TCP_ACCEPT_BASIC"
-	case TCP_CLOSE_BASIC:
-		return "TCP_CLOSE_BASIC"
-	case CONNTRACK_ADD_DROP:
-		return "CONNTRACK_ADD_DROP"
-	default:
-		return "UNKNOWN_DROP"
-	}
-}

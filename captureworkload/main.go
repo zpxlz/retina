@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"go.uber.org/zap"
 
+	"github.com/microsoft/retina/internal/buildinfo"
 	"github.com/microsoft/retina/pkg/capture"
 	captureConstants "github.com/microsoft/retina/pkg/capture/constants"
 
@@ -14,43 +16,39 @@ import (
 	"github.com/microsoft/retina/pkg/telemetry"
 )
 
-var (
-	// applicationInsightsID is the instrumentation key for Azure Application Insights
-	// It is set during the build process using the -ldflags flag
-	// If it is set, the application will send telemetry to the corresponding Application Insights resource.
-	applicationInsightsID string //nolint
-	version               string //nolint
-)
-
 func main() {
 	lOpts := log.GetDefaultLogOpts()
 	// Set Azure application insights ID if it is provided
-	if applicationInsightsID != "" {
-		lOpts.ApplicationInsightsID = applicationInsightsID
+	if buildinfo.ApplicationInsightsID != "" {
+		lOpts.ApplicationInsightsID = buildinfo.ApplicationInsightsID
 	}
 
 	log.SetupZapLogger(lOpts)
 	l := log.Logger().Named("captureworkload")
 	l.Info("Start to capture network traffic")
-	l.Info("Version: ", zap.String("version", version))
+	l.Info("Version: ", zap.String("version", buildinfo.Version))
 
 	var tel telemetry.Telemetry
-	if applicationInsightsID != "" {
-		l.Info("telemetry enabled", zap.String("applicationInsightsID", applicationInsightsID))
-		telemetry.InitAppInsights(applicationInsightsID, version)
+	var err error
+	if buildinfo.ApplicationInsightsID != "" {
+		l.Info("telemetry enabled", zap.String("applicationInsightsID", buildinfo.ApplicationInsightsID))
+		telemetry.InitAppInsights(buildinfo.ApplicationInsightsID, buildinfo.Version)
 		defer telemetry.ShutdownAppInsights()
-		tel = telemetry.NewAppInsightsTelemetryClient("retina-capture", map[string]string{
-			"version":                   version,
+		tel, err = telemetry.NewAppInsightsTelemetryClient("retina-capture", map[string]string{
+			"version":                   buildinfo.Version,
 			telemetry.PropertyApiserver: os.Getenv(captureConstants.ApiserverEnvKey),
 		})
+		if err != nil {
+			log.Logger().Panic("failed to create telemetry client", zap.Error(err))
+		}
 	} else {
 		tel = telemetry.NewNoopTelemetry()
 	}
 
-	// Create channel to listen for signals.
-	sigChan := make(chan os.Signal, 1)
-	// Notify sigChan for SIGTERM.
-	signal.Notify(sigChan, syscall.SIGTERM)
+	// Create a context that is canceled when a termination signal is received.
+	// This controls the capture duration - SIGTERM stops the capture.
+	captureCtx, captureCancel := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+	defer captureCancel()
 
 	cm := capture.NewCaptureManager(l, tel)
 
@@ -59,12 +57,16 @@ func main() {
 			l.Error("Failed to cleanup network capture", zap.Error(err))
 		}
 	}()
-	srcDir, err := cm.CaptureNetwork(sigChan)
+	srcDir, err := cm.CaptureNetwork(captureCtx)
 	if err != nil {
 		l.Error("Failed to capture network traffic", zap.Error(err))
 		os.Exit(1)
 	}
-	if err := cm.OutputCapture(srcDir); err != nil {
+
+	// Use a fresh context for output operations since captureCtx may be cancelled
+	// (e.g., rotating captures are stopped via SIGTERM). Output still needs to complete.
+	outputCtx := context.Background()
+	if err := cm.OutputCapture(outputCtx, srcDir); err != nil {
 		l.Error("Failed to output network traffic", zap.Error(err))
 	}
 	l.Info("Done for capturing network traffic")

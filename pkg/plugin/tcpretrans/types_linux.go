@@ -3,26 +3,25 @@
 package tcpretrans
 
 import (
-	"errors"
+	"sync"
 
-	gadgetcontext "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-context"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets/trace/tcpretrans/tracer"
+	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
+	"github.com/cilium/ebpf/perf"
 	kcfg "github.com/microsoft/retina/pkg/config"
 	"github.com/microsoft/retina/pkg/enricher"
 	"github.com/microsoft/retina/pkg/log"
-	"github.com/microsoft/retina/pkg/plugin/api"
 )
 
-const (
-	Name api.PluginName = "tcpretrans"
-)
+const name = "tcpretrans"
 
 type tcpretrans struct {
-	cfg       *kcfg.Config
-	l         *log.ZapLogger
-	tracer    *tracer.Tracer
-	gadgetCtx *gadgetcontext.GadgetContext
-	enricher  enricher.EnricherInterface
+	cfg             *kcfg.Config
+	l               *log.ZapLogger
+	enricher        enricher.EnricherInterface
+	externalChannel chan *v1.Event
+	objs            *tcpretransObjects
+	reader          *perf.Reader
+	hooks           []interface{ Close() error }
+	recordsChannel  chan perf.Record
+	wg              sync.WaitGroup
 }
-
-var errEnricherNotInitialized = errors.New("enricher not initialized")

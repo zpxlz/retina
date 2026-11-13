@@ -22,4 +22,17 @@ type CaptureConfig struct {
 
 	// JobNumLimit indicates the maximum number of jobs that can be created for each Capture.
 	CaptureJobNumLimit int `yaml:"captureJobNumLimit"`
+
+	// EnableManagedStorageAccount indicates whether a managed storage account will be created to store the captured network artifacts.
+	EnableManagedStorageAccount bool `yaml:"enableManagedStorageAccount"`
+	// AzureCredentialConfig indicates the path of Azure credential configuration file.
+	AzureCredentialConfig string `yaml:"azureCredentialConfig"`
+
+	// CaptureHostPathBaseDir is the absolute, operator-controlled directory on every
+	// node under which Capture CRs may write artifacts. The user-supplied
+	// OutputConfiguration.HostPath is treated as a relative subpath name and joined
+	// under this directory. CR authors cannot influence the base, so they cannot
+	// place artifacts anywhere else on the node filesystem.
+	// If unset, the operator defaults to /var/log/retina/captures.
+	CaptureHostPathBaseDir string `yaml:"captureHostPathBaseDir"`
 }

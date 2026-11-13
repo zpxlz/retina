@@ -20,8 +20,9 @@ type kprobeMapKey struct {
 }
 
 type kprobeMetricsMapKey struct {
-	DropType  uint32
-	ReturnVal uint32
+	DropType  uint16
+	Padding   [2]uint8
+	ReturnVal int32
 }
 
 type kprobeMetricsMapValue struct {
@@ -34,15 +35,12 @@ type kprobePacket struct {
 	DstIp       uint32
 	SrcPort     uint16
 	DstPort     uint16
+	SkbLen      uint32
+	ReturnVal   uint32
+	DropType    uint16
 	Proto       uint8
-	_           [3]byte
-	SkbLen      uint64
-	Direction   uint32
-	Key         kprobeMetricsMapKey
-	_           [4]byte
-	Ts          uint64
 	InFiltermap bool
-	_           [7]byte
+	Ts          uint64
 }
 
 // loadKprobe returns the embedded CollectionSpec for kprobe.
@@ -86,27 +84,32 @@ type kprobeSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type kprobeProgramSpecs struct {
-	InetCskAccept         *ebpf.ProgramSpec `ebpf:"inet_csk_accept"`
-	InetCskAcceptRet      *ebpf.ProgramSpec `ebpf:"inet_csk_accept_ret"`
-	NfConntrackConfirm    *ebpf.ProgramSpec `ebpf:"nf_conntrack_confirm"`
-	NfConntrackConfirmRet *ebpf.ProgramSpec `ebpf:"nf_conntrack_confirm_ret"`
-	NfHookSlow            *ebpf.ProgramSpec `ebpf:"nf_hook_slow"`
-	NfHookSlowRet         *ebpf.ProgramSpec `ebpf:"nf_hook_slow_ret"`
-	NfNatInetFn           *ebpf.ProgramSpec `ebpf:"nf_nat_inet_fn"`
-	NfNatInetFnRet        *ebpf.ProgramSpec `ebpf:"nf_nat_inet_fn_ret"`
-	TcpV4ConnectRet       *ebpf.ProgramSpec `ebpf:"tcp_v4_connect_ret"`
+	InetCskAccept           *ebpf.ProgramSpec `ebpf:"inet_csk_accept"`
+	InetCskAcceptFexit      *ebpf.ProgramSpec `ebpf:"inet_csk_accept_fexit"`
+	InetCskAcceptRet        *ebpf.ProgramSpec `ebpf:"inet_csk_accept_ret"`
+	NfConntrackConfirm      *ebpf.ProgramSpec `ebpf:"nf_conntrack_confirm"`
+	NfConntrackConfirmFexit *ebpf.ProgramSpec `ebpf:"nf_conntrack_confirm_fexit"`
+	NfConntrackConfirmRet   *ebpf.ProgramSpec `ebpf:"nf_conntrack_confirm_ret"`
+	NfHookSlow              *ebpf.ProgramSpec `ebpf:"nf_hook_slow"`
+	NfHookSlowFexit         *ebpf.ProgramSpec `ebpf:"nf_hook_slow_fexit"`
+	NfHookSlowRet           *ebpf.ProgramSpec `ebpf:"nf_hook_slow_ret"`
+	NfNatInetFn             *ebpf.ProgramSpec `ebpf:"nf_nat_inet_fn"`
+	NfNatInetFnFexit        *ebpf.ProgramSpec `ebpf:"nf_nat_inet_fn_fexit"`
+	NfNatInetFnRet          *ebpf.ProgramSpec `ebpf:"nf_nat_inet_fn_ret"`
+	TcpV4ConnectFexit       *ebpf.ProgramSpec `ebpf:"tcp_v4_connect_fexit"`
+	TcpV4ConnectRet         *ebpf.ProgramSpec `ebpf:"tcp_v4_connect_ret"`
 }
 
 // kprobeMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type kprobeMapSpecs struct {
-	AcceptPids       *ebpf.MapSpec `ebpf:"accept_pids"`
-	DropPids         *ebpf.MapSpec `ebpf:"drop_pids"`
-	DropreasonEvents *ebpf.MapSpec `ebpf:"dropreason_events"`
-	MetricsMap       *ebpf.MapSpec `ebpf:"metrics_map"`
-	NatdropPids      *ebpf.MapSpec `ebpf:"natdrop_pids"`
-	RetinaFilterMap  *ebpf.MapSpec `ebpf:"retina_filter_map"`
+	RetinaDropreasonAcceptPids  *ebpf.MapSpec `ebpf:"retina_dropreason_accept_pids"`
+	RetinaDropreasonDropPids    *ebpf.MapSpec `ebpf:"retina_dropreason_drop_pids"`
+	RetinaDropreasonEvents      *ebpf.MapSpec `ebpf:"retina_dropreason_events"`
+	RetinaDropreasonMetrics     *ebpf.MapSpec `ebpf:"retina_dropreason_metrics"`
+	RetinaDropreasonNatdropPids *ebpf.MapSpec `ebpf:"retina_dropreason_natdrop_pids"`
+	RetinaFilter                *ebpf.MapSpec `ebpf:"retina_filter"`
 }
 
 // kprobeObjects contains all objects after they have been loaded into the kernel.
@@ -128,22 +131,22 @@ func (o *kprobeObjects) Close() error {
 //
 // It can be passed to loadKprobeObjects or ebpf.CollectionSpec.LoadAndAssign.
 type kprobeMaps struct {
-	AcceptPids       *ebpf.Map `ebpf:"accept_pids"`
-	DropPids         *ebpf.Map `ebpf:"drop_pids"`
-	DropreasonEvents *ebpf.Map `ebpf:"dropreason_events"`
-	MetricsMap       *ebpf.Map `ebpf:"metrics_map"`
-	NatdropPids      *ebpf.Map `ebpf:"natdrop_pids"`
-	RetinaFilterMap  *ebpf.Map `ebpf:"retina_filter_map"`
+	RetinaDropreasonAcceptPids  *ebpf.Map `ebpf:"retina_dropreason_accept_pids"`
+	RetinaDropreasonDropPids    *ebpf.Map `ebpf:"retina_dropreason_drop_pids"`
+	RetinaDropreasonEvents      *ebpf.Map `ebpf:"retina_dropreason_events"`
+	RetinaDropreasonMetrics     *ebpf.Map `ebpf:"retina_dropreason_metrics"`
+	RetinaDropreasonNatdropPids *ebpf.Map `ebpf:"retina_dropreason_natdrop_pids"`
+	RetinaFilter                *ebpf.Map `ebpf:"retina_filter"`
 }
 
 func (m *kprobeMaps) Close() error {
 	return _KprobeClose(
-		m.AcceptPids,
-		m.DropPids,
-		m.DropreasonEvents,
-		m.MetricsMap,
-		m.NatdropPids,
-		m.RetinaFilterMap,
+		m.RetinaDropreasonAcceptPids,
+		m.RetinaDropreasonDropPids,
+		m.RetinaDropreasonEvents,
+		m.RetinaDropreasonMetrics,
+		m.RetinaDropreasonNatdropPids,
+		m.RetinaFilter,
 	)
 }
 
@@ -151,27 +154,37 @@ func (m *kprobeMaps) Close() error {
 //
 // It can be passed to loadKprobeObjects or ebpf.CollectionSpec.LoadAndAssign.
 type kprobePrograms struct {
-	InetCskAccept         *ebpf.Program `ebpf:"inet_csk_accept"`
-	InetCskAcceptRet      *ebpf.Program `ebpf:"inet_csk_accept_ret"`
-	NfConntrackConfirm    *ebpf.Program `ebpf:"nf_conntrack_confirm"`
-	NfConntrackConfirmRet *ebpf.Program `ebpf:"nf_conntrack_confirm_ret"`
-	NfHookSlow            *ebpf.Program `ebpf:"nf_hook_slow"`
-	NfHookSlowRet         *ebpf.Program `ebpf:"nf_hook_slow_ret"`
-	NfNatInetFn           *ebpf.Program `ebpf:"nf_nat_inet_fn"`
-	NfNatInetFnRet        *ebpf.Program `ebpf:"nf_nat_inet_fn_ret"`
-	TcpV4ConnectRet       *ebpf.Program `ebpf:"tcp_v4_connect_ret"`
+	InetCskAccept           *ebpf.Program `ebpf:"inet_csk_accept"`
+	InetCskAcceptFexit      *ebpf.Program `ebpf:"inet_csk_accept_fexit"`
+	InetCskAcceptRet        *ebpf.Program `ebpf:"inet_csk_accept_ret"`
+	NfConntrackConfirm      *ebpf.Program `ebpf:"nf_conntrack_confirm"`
+	NfConntrackConfirmFexit *ebpf.Program `ebpf:"nf_conntrack_confirm_fexit"`
+	NfConntrackConfirmRet   *ebpf.Program `ebpf:"nf_conntrack_confirm_ret"`
+	NfHookSlow              *ebpf.Program `ebpf:"nf_hook_slow"`
+	NfHookSlowFexit         *ebpf.Program `ebpf:"nf_hook_slow_fexit"`
+	NfHookSlowRet           *ebpf.Program `ebpf:"nf_hook_slow_ret"`
+	NfNatInetFn             *ebpf.Program `ebpf:"nf_nat_inet_fn"`
+	NfNatInetFnFexit        *ebpf.Program `ebpf:"nf_nat_inet_fn_fexit"`
+	NfNatInetFnRet          *ebpf.Program `ebpf:"nf_nat_inet_fn_ret"`
+	TcpV4ConnectFexit       *ebpf.Program `ebpf:"tcp_v4_connect_fexit"`
+	TcpV4ConnectRet         *ebpf.Program `ebpf:"tcp_v4_connect_ret"`
 }
 
 func (p *kprobePrograms) Close() error {
 	return _KprobeClose(
 		p.InetCskAccept,
+		p.InetCskAcceptFexit,
 		p.InetCskAcceptRet,
 		p.NfConntrackConfirm,
+		p.NfConntrackConfirmFexit,
 		p.NfConntrackConfirmRet,
 		p.NfHookSlow,
+		p.NfHookSlowFexit,
 		p.NfHookSlowRet,
 		p.NfNatInetFn,
+		p.NfNatInetFnFexit,
 		p.NfNatInetFnRet,
+		p.TcpV4ConnectFexit,
 		p.TcpV4ConnectRet,
 	)
 }

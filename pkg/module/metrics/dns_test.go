@@ -4,16 +4,24 @@
 package metrics
 
 import (
+	"log/slog"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/cilium/cilium/api/v1/flow"
-	"github.com/golang/mock/gomock"
+	"github.com/microsoft/retina/crd/api/v1alpha1"
 	"github.com/microsoft/retina/pkg/log"
-	"github.com/microsoft/retina/pkg/metrics"
+	metricsinit "github.com/microsoft/retina/pkg/metrics"
 	"github.com/microsoft/retina/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/mock/gomock"
 	"gotest.tools/v3/assert"
+)
+
+const (
+	request  = "request"
+	response = "response"
 )
 
 func TestGetLabels(t *testing.T) {
@@ -21,25 +29,38 @@ func TestGetLabels(t *testing.T) {
 	l := log.Logger().Named("testGetLabels")
 
 	tests := []struct {
-		name string
-		want []string
-		d    *DNSMetrics
+		name       string
+		want       []string
+		d          *DNSMetrics
+		labelTypes string
 	}{
 		{
-			name: "basic context",
-			want: utils.DNSLabels,
+			name: "basic context request labels",
+			want: utils.DNSRequestLabels,
 			d: &DNSMetrics{
-				baseMetricObject: baseMetricObject{
+				baseMetricInterface: &baseMetricObject{
 					srcCtx: nil,
 					dstCtx: nil,
 				},
 			},
+			labelTypes: request,
 		},
 		{
-			name: "local context",
-			want: append(utils.DNSLabels, "ip", "namespace", "podname", "workloadKind", "workloadName", "service", "port"),
+			name: "basic context response labels",
+			want: utils.DNSResponseLabels,
 			d: &DNSMetrics{
-				baseMetricObject: baseMetricObject{
+				baseMetricInterface: &baseMetricObject{
+					srcCtx: nil,
+					dstCtx: nil,
+				},
+			},
+			labelTypes: response,
+		},
+		{
+			name: "local context request labels",
+			want: append(utils.DNSRequestLabels, "ip", "namespace", "podname", "workload_kind", "workload_name", "service", "port"),
+			d: &DNSMetrics{
+				baseMetricInterface: &baseMetricObject{
 					srcCtx: &ContextOptions{
 						option:    localCtx,
 						IP:        true,
@@ -53,12 +74,22 @@ func TestGetLabels(t *testing.T) {
 					l:      l,
 				},
 			},
+			labelTypes: request,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.d.getLabels(); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("GetLabels() = %v, want %v", got, tt.want)
+			switch tt.labelTypes {
+			case request:
+				if got := tt.d.getRequestLabels(); !reflect.DeepEqual(got, tt.want) {
+					t.Errorf("GetRequestLabels() = %v, want %v", got, tt.want)
+				}
+			case response:
+				if got := tt.d.getResponseLabels(); !reflect.DeepEqual(got, tt.want) {
+					t.Errorf("GetResponseLabels() = %v, want %v", got, tt.want)
+				}
+			default:
+				t.Errorf("Invalid label type")
 			}
 		})
 	}
@@ -66,13 +97,19 @@ func TestGetLabels(t *testing.T) {
 
 func TestValues(t *testing.T) {
 	testR := &flow.Flow{}
-	utils.AddDnsInfo(testR, "R", 0, "bing.com", []string{"A"}, 1, []string{"1.1.1.1"})
+	extR := utils.NewExtensions()
+	utils.AddDNSInfo(testR, extR, "R", 0, "bing.com", []string{"A"}, 1, []string{"1.1.1.1"})
+	utils.SetExtensions(testR, extR)
 
 	testQ := &flow.Flow{}
-	utils.AddDnsInfo(testQ, "Q", 0, "bing.com", []string{"A"}, 0, []string{})
+	extQ := utils.NewExtensions()
+	utils.AddDNSInfo(testQ, extQ, "Q", 0, "bing.com", []string{"A"}, 0, []string{})
+	utils.SetExtensions(testQ, extQ)
 
 	testU := &flow.Flow{}
-	utils.AddDnsInfo(testU, "U", 0, "bing.com", []string{"A"}, 0, []string{})
+	extU := utils.NewExtensions()
+	utils.AddDNSInfo(testU, extU, "U", 0, "bing.com", []string{"A"}, 0, []string{})
+	utils.SetExtensions(testU, extU)
 
 	tests := []struct {
 		name   string
@@ -90,7 +127,7 @@ func TestValues(t *testing.T) {
 		},
 		{
 			name:   "Query",
-			want:   []string{"NOERROR", "A", "bing.com", "", "0"},
+			want:   []string{"A", "bing.com"},
 			d:      &DNSMetrics{metricName: utils.DNSRequestCounterName},
 			input:  testQ,
 			l7Type: flow.L7FlowType_REQUEST,
@@ -133,8 +170,22 @@ func TestValues(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.d.values(tt.input); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("Values() = %v, want %v", got, tt.want)
+			switch tt.l7Type {
+			case flow.L7FlowType_REQUEST:
+				if got := tt.d.requestValues(tt.input); !reflect.DeepEqual(got, tt.want) {
+					t.Errorf("RequestValues() = %v, want %v", got, tt.want)
+				}
+			case flow.L7FlowType_RESPONSE:
+				if got := tt.d.responseValues(tt.input); !reflect.DeepEqual(got, tt.want) {
+					t.Errorf("ResponseValues() = %v, want %v", got, tt.want)
+				}
+			case flow.L7FlowType_UNKNOWN_L7_TYPE:
+				if got := tt.d.responseValues(tt.input); !reflect.DeepEqual(got, tt.want) {
+					t.Errorf("ResponseValues() = %v, want %v", got, tt.want)
+				}
+			case flow.L7FlowType_SAMPLE:
+			default:
+				t.Errorf("Invalid L7FlowType")
 			}
 			if tt.input == nil {
 				return
@@ -154,108 +205,134 @@ func TestProcessLocalCtx(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	testR := &flow.Flow{}
-	utils.AddDnsInfo(testR, "R", 0, "bing.com", []string{"A"}, 1, []string{"1.1.1.1"})
-
-	testIngress := &flow.Flow{TrafficDirection: flow.TrafficDirection_INGRESS}
-	utils.AddDnsInfo(testIngress, "R", 0, "bing.com", []string{"A"}, 1, []string{"1.1.1.1"})
-
-	testEgress := &flow.Flow{TrafficDirection: flow.TrafficDirection_EGRESS}
-	utils.AddDnsInfo(testEgress, "R", 0, "bing.com", []string{"A"}, 1, []string{"1.1.1.1"})
-
 	tests := []struct {
 		name           string
-		d              *DNSMetrics
 		input          *flow.Flow
-		output         map[string][]string
 		expectedLabels []string
 		metricsUpdate  bool
 	}{
 		{
-			name:          "No context labels",
-			input:         nil,
-			output:        nil,
-			d:             &DNSMetrics{},
+			name: "No context labels",
+			input: &flow.Flow{
+				Verdict: utils.Verdict_DNS,
+			},
 			metricsUpdate: false,
 		},
 		{
-			name:  "Only ingress labels",
-			input: testR,
-			output: map[string][]string{
-				ingress: {"PodA", "NamespaceA"},
-				egress:  nil,
-			},
-			d: &DNSMetrics{
-				metricName: utils.DNSResponseCounterName,
-				baseMetricObject: baseMetricObject{
-					l: l,
+			name: "Only ingress labels",
+			input: &flow.Flow{
+				Verdict:          utils.Verdict_DNS,
+				TrafficDirection: flow.TrafficDirection_INGRESS,
+				Destination: &flow.Endpoint{
+					PodName:   "PodB",
+					Namespace: "NamespaceB",
 				},
 			},
-			expectedLabels: []string{"NOERROR", "A", "bing.com", "1.1.1.1", "1", "PodA", "NamespaceA"},
+			expectedLabels: []string{"NOERROR", "A", "bing.com", "1.1.1.1", "1", "NamespaceB", "PodB"},
 			metricsUpdate:  true,
 		},
 		{
-			name:  "Only egress labels",
-			input: testR,
-			output: map[string][]string{
-				ingress: nil,
-				egress:  {"PodA", "NamespaceA"},
-			},
-			d: &DNSMetrics{
-				metricName: utils.DNSResponseCounterName,
-				baseMetricObject: baseMetricObject{
-					l: l,
+			name: "Only egress labels",
+			input: &flow.Flow{
+				Verdict:          utils.Verdict_DNS,
+				TrafficDirection: flow.TrafficDirection_EGRESS,
+				Source: &flow.Endpoint{
+					PodName:   "PodA",
+					Namespace: "NamespaceA",
 				},
 			},
-			expectedLabels: []string{"NOERROR", "A", "bing.com", "1.1.1.1", "1", "PodA", "NamespaceA"},
+			expectedLabels: []string{"NOERROR", "A", "bing.com", "1.1.1.1", "1", "NamespaceA", "PodA"},
 			metricsUpdate:  true,
 		},
 		{
-			name:  "Both ingress and egress labels with ingress flow",
-			input: testIngress,
-			output: map[string][]string{
-				ingress: {"PodA", "NamespaceA"},
-				egress:  {"PodB", "NamespaceB"},
-			},
-			d: &DNSMetrics{
-				metricName: utils.DNSResponseCounterName,
-				baseMetricObject: baseMetricObject{
-					l: l,
+			name: "Both ingress and egress labels with ingress flow",
+			input: &flow.Flow{
+				Verdict:          utils.Verdict_DNS,
+				TrafficDirection: flow.TrafficDirection_INGRESS,
+				Destination: &flow.Endpoint{
+					PodName:   "PodA",
+					Namespace: "NamespaceA",
+				},
+				Source: &flow.Endpoint{
+					PodName:   "PodB",
+					Namespace: "NamespaceB",
 				},
 			},
-			expectedLabels: []string{"NOERROR", "A", "bing.com", "1.1.1.1", "1", "PodA", "NamespaceA"},
+			expectedLabels: []string{"NOERROR", "A", "bing.com", "1.1.1.1", "1", "NamespaceA", "PodA"},
 			metricsUpdate:  true,
 		},
 		{
-			name:  "Both ingress and egress labels with egress flow",
-			input: testEgress,
-			output: map[string][]string{
-				ingress: {"PodA", "NamespaceA"},
-				egress:  {"PodB", "NamespaceB"},
-			},
-			d: &DNSMetrics{
-				metricName: utils.DNSResponseCounterName,
-				baseMetricObject: baseMetricObject{
-					l: l,
+			name: "Both source and destination labels with egress flow",
+			input: &flow.Flow{
+				Verdict:          utils.Verdict_DNS,
+				TrafficDirection: flow.TrafficDirection_EGRESS,
+				Source: &flow.Endpoint{
+					PodName:   "PodB",
+					Namespace: "NamespaceB",
+				},
+				Destination: &flow.Endpoint{
+					PodName:   "PodA",
+					Namespace: "NamespaceA",
 				},
 			},
-			expectedLabels: []string{"NOERROR", "A", "bing.com", "1.1.1.1", "1", "PodB", "NamespaceB"},
+			expectedLabels: []string{"NOERROR", "A", "bing.com", "1.1.1.1", "1", "NamespaceB", "PodB"},
 			metricsUpdate:  true,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			m := NewMockContextOptionsInterface(ctrl) //nolint:typecheck
-			m.EXPECT().getLocalCtxValues(tt.input).Return(tt.output).Times(1)
+			ext := utils.NewExtensions()
+			utils.AddDNSInfo(tt.input, ext, "R", 0, "bing.com", []string{"A"}, 1, []string{"1.1.1.1"})
+			utils.SetExtensions(tt.input, ext)
 
-			mockCV := metrics.NewMockICounterVec(ctrl)
+			mockCV := metricsinit.NewMockCounterVec(ctrl)
 			if tt.metricsUpdate {
 				mockCV.EXPECT().WithLabelValues(tt.expectedLabels).Return(c).Times(1)
 			}
 
-			tt.d.dnsMetrics = mockCV
-			tt.d.srcCtx = m
-			tt.d.processLocalCtxFlow(tt.input)
+			ctxOptions := &v1alpha1.MetricsContextOptions{
+				MetricName: utils.DNSResponseCounterName,
+				SourceLabels: []string{
+					podCtxOption,
+					namespaceCtxOption,
+				},
+			}
+			d := NewDNSMetrics(ctxOptions, l, localContext, 0)
+			d.dnsMetrics = mockCV
+
+			d.ProcessFlow(tt.input)
+
+			// There should be no tracked metrics when TTL is infinite
+			assert.Equal(t, 0, len(d.trackedMetricLabels()), "there should be no tracked metrics when TTL is infinite")
+
+			// Test TTL based expiration
+			metricsinit.InitializeMetrics(slog.Default())
+
+			// Set the TTL to something high to ensure that our call to expire is the only one that expires the metrics
+			d = NewDNSMetrics(ctxOptions, l, localContext, time.Minute)
+			d.dnsMetrics = mockCV
+
+			if tt.metricsUpdate {
+				mockCV.EXPECT().WithLabelValues(tt.expectedLabels).Return(c).Times(1)
+			}
+
+			d.ProcessFlow(tt.input)
+
+			if tt.metricsUpdate {
+				mockCV.EXPECT().DeleteLabelValues(tt.expectedLabels).Return(true).Times(1)
+			}
+
+			for _, ls := range d.trackedMetricLabels() {
+				assert.Check(t, d.expire(ls), "metrics should expire successfully")
+			}
+
+			// Test that clean calls the base object
+			baseMetricObjectMock := NewMockbaseMetricInterface(ctrl)
+			d.baseMetricInterface = baseMetricObjectMock
+
+			baseMetricObjectMock.EXPECT().clean().Times(1)
+
+			d.Clean()
 		})
 	}
 }

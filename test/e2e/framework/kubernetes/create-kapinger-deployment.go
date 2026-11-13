@@ -107,6 +107,9 @@ func (c *CreateKapingerDeployment) GetKapingerDeployment() *appsv1.Deployment {
 				},
 
 				Spec: v1.PodSpec{
+					NodeSelector: map[string]string{
+						"kubernetes.io/os": "linux",
+					},
 					Affinity: &v1.Affinity{
 						PodAntiAffinity: &v1.PodAntiAffinity{
 							// prefer an even spread across the cluster to avoid scheduling on the same node
@@ -129,13 +132,13 @@ func (c *CreateKapingerDeployment) GetKapingerDeployment() *appsv1.Deployment {
 					Containers: []v1.Container{
 						{
 							Name:  "kapinger",
-							Image: "acnpublic.azurecr.io/kapinger:be57650",
+							Image: "acnpublic.azurecr.io/kapinger:v0.0.23-9-g23ef222",
 							Resources: v1.ResourceRequirements{
 								Requests: v1.ResourceList{
 									"memory": resource.MustParse("20Mi"),
 								},
 								Limits: v1.ResourceList{
-									"memory": resource.MustParse("20Mi"),
+									"memory": resource.MustParse("40Mi"),
 								},
 							},
 							Ports: []v1.ContainerPort{
@@ -144,6 +147,10 @@ func (c *CreateKapingerDeployment) GetKapingerDeployment() *appsv1.Deployment {
 								},
 							},
 							Env: []v1.EnvVar{
+								{
+									Name:  "GODEBUG",
+									Value: "netdns=go",
+								},
 								{
 									Name:  "TARGET_TYPE",
 									Value: "service",

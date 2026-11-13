@@ -6,10 +6,6 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 )
 
-const (
-	unknown = "__uknown__"
-)
-
 var (
 	pluginKey    = attribute.Key("plugin")
 	eventTypeKey = attribute.Key("event_type")
@@ -34,20 +30,24 @@ var (
 	remoteNodeKey      = attribute.Key("remote_node")
 
 	// todo move to attributes pkg?
-	Type           = "type"
-	Reason         = "reason"
-	Direction      = "direction"
-	SourceNodeName = "source_node_name"
-	TargetNodeName = "target_node_name"
-	State          = "state"
-	Address        = "address"
-	Port           = "port"
-	StatName       = "statistic_name"
-	InterfaceName  = "interface_name"
-	Flag           = "flag"
-	Endpoint       = "endpoint"
-	AclRule        = "aclrule"
-	Active         = "ACTIVE"
+	Type                  = "type"
+	Reason                = "reason"
+	Direction             = "direction"
+	IsReply               = "is_reply"
+	SourceNodeName        = "source_node_name"
+	TargetNodeName        = "target_node_name"
+	State                 = "state"
+	Address               = "address"
+	Port                  = "port"
+	StatName              = "statistic_name"
+	InterfaceName         = "interface_name"
+	InterfaceNameConstant = "all_interfaces"
+	Flag                  = "flag"
+	Endpoint              = "endpoint"
+	AclRule               = "aclrule"
+	Active                = "ACTIVE"
+	Device                = "device"
+	Metric                = "metric"
 
 	// TCP Connection Statistic Names
 	ResetCount           = "ResetCount"
@@ -81,7 +81,8 @@ var (
 	Windows   = "windows"
 
 	// DNS labels.
-	DNSLabels = []string{"return_code", "query_type", "query", "response", "num_response"}
+	DNSRequestLabels  = []string{"query_type", "query"}
+	DNSResponseLabels = []string{"return_code", "query_type", "query", "response", "num_response"}
 )
 
 func GetPluginEventAttributes(attrs []attribute.KeyValue, pluginName, eventName, timestamp string) []attribute.KeyValue {

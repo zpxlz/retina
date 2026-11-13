@@ -7,11 +7,13 @@ import (
 	"log"
 	"net/http"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/microsoft/retina/test/retry"
 	promclient "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 )
 
 var (
@@ -21,27 +23,34 @@ var (
 	defaultRetryAttempts = 60
 )
 
-func CheckMetric(promAddress, metricName string, validMetric map[string]string) error {
+func CheckMetric(promAddress, metricName string, validMetric map[string]string, partial ...bool) error {
 	defaultRetrier := retry.Retrier{Attempts: defaultRetryAttempts, Delay: defaultRetryDelay}
 
 	ctx := context.Background()
 	pctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Default partial to false if not provided
+	usePartial := len(partial) > 0 && partial[0]
+
 	metrics := map[string]*promclient.MetricFamily{}
 	scrapeMetricsFn := func() error {
-		log.Printf("checking for drop metrics on %s", promAddress)
+		log.Printf("checking for metrics on %s", promAddress)
 		var err error
 
 		// obtain a full dump of all metrics on the endpoint
-		metrics, err = getAllPrometheusMetrics(promAddress)
+		metrics, err = getAllPrometheusMetricsFromURL(promAddress)
 		if err != nil {
 			return fmt.Errorf("could not start port forward within %ds: %w	", defaultTimeout, err)
 		}
 
 		// loop through each metric to check for a match,
 		// if none is found then log and return an error which will trigger a retry
-		err = verifyValidMetricPresent(metricName, metrics, validMetric)
+		if usePartial {
+			err = verifyValidMetricPresentPartial(metricName, metrics, validMetric)
+		} else {
+			err = verifyValidMetricPresent(metricName, metrics, validMetric)
+		}
 		if err != nil {
 			log.Printf("failed to find metric matching %s: %+v\n", metricName, validMetric)
 			return ErrNoMetricFound
@@ -57,6 +66,46 @@ func CheckMetric(promAddress, metricName string, validMetric map[string]string) 
 	return nil
 }
 
+func GetMetricGuageValueFromBuffer(prometheusMetricData []byte, metricName string, expectedLabels map[string]string) (float64, error) {
+	metrics, err := getAllPrometheusMetricsFromBuffer(prometheusMetricData)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse prometheus metrics: %w", err)
+	}
+
+	for _, metric := range metrics {
+		if metric.GetName() == metricName {
+			for _, metric := range metric.GetMetric() {
+				// get all labels and values on the metric
+				metricLabels := map[string]string{}
+				for _, label := range metric.GetLabel() {
+					metricLabels[label.GetName()] = label.GetValue()
+				}
+				if reflect.DeepEqual(metricLabels, expectedLabels) {
+					return metric.GetGauge().GetValue(), nil
+				}
+
+			}
+		}
+	}
+
+	return 0, fmt.Errorf("%w: %s", ErrNoMetricFound, metricName)
+}
+
+func CheckMetricFromBuffer(prometheusMetricData []byte, metricName string, validMetric map[string]string) error {
+	metrics, err := getAllPrometheusMetricsFromBuffer(prometheusMetricData)
+	if err != nil {
+		return fmt.Errorf("failed to parse prometheus metrics: %w", err)
+	}
+
+	err = verifyValidMetricPresent(metricName, metrics, validMetric)
+	if err != nil {
+		log.Printf("failed to find metric matching %s: %+v\n", metricName, validMetric)
+		return ErrNoMetricFound
+	}
+
+	return nil
+}
+
 func verifyValidMetricPresent(metricName string, data map[string]*promclient.MetricFamily, validMetric map[string]string) error {
 	for _, metric := range data {
 		if metric.GetName() == metricName {
@@ -67,6 +116,12 @@ func verifyValidMetricPresent(metricName string, data map[string]*promclient.Met
 				for _, label := range metric.GetLabel() {
 					metricLabels[label.GetName()] = label.GetValue()
 				}
+
+				// if valid metric is empty, then we just need to make sure the metric and value is present
+				if len(validMetric) == 0 && len(metricLabels) > 0 {
+					return nil
+				}
+
 				if reflect.DeepEqual(metricLabels, validMetric) {
 					return nil
 				}
@@ -77,7 +132,7 @@ func verifyValidMetricPresent(metricName string, data map[string]*promclient.Met
 	return fmt.Errorf("failed to find metric matching: %+v: %w", validMetric, ErrNoMetricFound)
 }
 
-func getAllPrometheusMetrics(url string) (map[string]*promclient.MetricFamily, error) {
+func getAllPrometheusMetricsFromURL(url string) (map[string]*promclient.MetricFamily, error) {
 	client := http.Client{}
 	resp, err := client.Get(url) //nolint
 	if err != nil {
@@ -89,7 +144,7 @@ func getAllPrometheusMetrics(url string) (map[string]*promclient.MetricFamily, e
 		return nil, fmt.Errorf("HTTP request failed with status: %v", resp.Status) //nolint:goerr113,gocritic
 	}
 
-	metrics, err := parseReaderPrometheusMetrics(resp.Body)
+	metrics, err := ParseReaderPrometheusMetrics(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +152,60 @@ func getAllPrometheusMetrics(url string) (map[string]*promclient.MetricFamily, e
 	return metrics, nil
 }
 
-func parseReaderPrometheusMetrics(input io.Reader) (map[string]*promclient.MetricFamily, error) {
-	var parser expfmt.TextParser
+// verifyValidMetricPresentPartial checks if a metric exists with labels that contain
+// all the key-value pairs in validMetric (partial matching - the metric can have additional labels)
+func verifyValidMetricPresentPartial(metricName string, data map[string]*promclient.MetricFamily, validMetric map[string]string) error {
+	for _, metric := range data {
+		if metric.GetName() == metricName {
+			for _, metric := range metric.GetMetric() {
+
+				// get all labels and values on the metric
+				metricLabels := map[string]string{}
+				for _, label := range metric.GetLabel() {
+					metricLabels[label.GetName()] = label.GetValue()
+				}
+
+				// if valid metric is empty, then we just need to make sure the metric and value is present
+				if len(validMetric) == 0 && len(metricLabels) > 0 {
+					return nil
+				}
+
+				// Check if all key-value pairs in validMetric exist in metricLabels
+				allMatch := true
+				for key, value := range validMetric {
+					if metricLabels[key] != value {
+						allMatch = false
+						break
+					}
+				}
+
+				if allMatch {
+					return nil
+				}
+			}
+		}
+	}
+
+	return fmt.Errorf("failed to find metric matching: %+v: %w", validMetric, ErrNoMetricFound)
+}
+
+func getAllPrometheusMetricsFromBuffer(buf []byte) (map[string]*promclient.MetricFamily, error) {
+	parser := expfmt.NewTextParser(model.LegacyValidation)
+	reader := strings.NewReader(string(buf))
+	return parser.TextToMetricFamilies(reader) //nolint
+}
+
+func ParseReaderPrometheusMetrics(input io.Reader) (map[string]*promclient.MetricFamily, error) {
+	parser := expfmt.NewTextParser(model.LegacyValidation)
 	return parser.TextToMetricFamilies(input) //nolint
+}
+
+// When capturing promethus output via curl and exect, there's a lot
+// of garbage at the front
+func StripExecGarbage(s string) string {
+	index := strings.Index(s, "#")
+	if index == -1 {
+		return s
+	}
+	return s[index:]
 }

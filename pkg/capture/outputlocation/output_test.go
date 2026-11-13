@@ -4,6 +4,7 @@
 package outputlocation
 
 import (
+	"context"
 	"os"
 	"testing"
 
@@ -55,6 +56,12 @@ func TestEnabled(t *testing.T) {
 			enabled:        false,
 			outputLocation: NewBlobUpload(log.Logger().Named("blob")),
 		},
+		{
+			name:           "S3 output location is disabled",
+			env:            map[string]string{},
+			enabled:        false,
+			outputLocation: NewS3Upload(log.Logger().Named("s3")),
+		},
 	}
 
 	for _, tt := range cases {
@@ -104,6 +111,9 @@ func TestOutput(t *testing.T) {
 		},
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			for k, v := range tt.env {
@@ -116,7 +126,7 @@ func TestOutput(t *testing.T) {
 				}
 			}()
 
-			err := tt.outputLocation.Output(tt.srcPath)
+			err := tt.outputLocation.Output(ctx, tt.srcPath)
 			assert.Equal(t, tt.hasError, err != nil, "Output check failed on source file open")
 		})
 	}

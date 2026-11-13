@@ -6,6 +6,8 @@ package capture
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,10 +19,12 @@ import (
 	"go.uber.org/zap"
 
 	captureConstants "github.com/microsoft/retina/pkg/capture/constants"
+	"github.com/microsoft/retina/pkg/capture/file"
 	captureOutput "github.com/microsoft/retina/pkg/capture/outputlocation"
 	captureProvider "github.com/microsoft/retina/pkg/capture/provider"
 	"github.com/microsoft/retina/pkg/log"
 	"github.com/microsoft/retina/pkg/telemetry"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // CaptureManager captures network packets and metadata into tar ball, then send the tar ball to the location(s)
@@ -31,6 +35,8 @@ type CaptureManager struct {
 	tel                    telemetry.Telemetry
 }
 
+var errNegativeFileCount = errors.New("file count must be >= 0")
+
 func NewCaptureManager(logger *log.ZapLogger, tel telemetry.Telemetry) *CaptureManager {
 	return &CaptureManager{
 		l:                      logger,
@@ -39,8 +45,14 @@ func NewCaptureManager(logger *log.ZapLogger, tel telemetry.Telemetry) *CaptureM
 	}
 }
 
-func (cm *CaptureManager) CaptureNetwork(sigChan <-chan os.Signal) (string, error) {
-	tmpLocation, err := cm.networkCaptureProvider.Setup(cm.captureName(), cm.captureNodeHostName())
+func (cm *CaptureManager) CaptureNetwork(ctx context.Context) (string, error) {
+	startTimestamp, err := cm.captureStartTimestamp()
+	if err != nil {
+		return "", err
+	}
+
+	filename := file.CaptureFilename{CaptureName: cm.captureName(), NodeHostname: cm.captureNodeHostName(), StartTimestamp: startTimestamp}
+	tmpLocation, err := cm.networkCaptureProvider.Setup(filename)
 	if err != nil {
 		return "", err
 	}
@@ -57,7 +69,12 @@ func (cm *CaptureManager) CaptureNetwork(sigChan <-chan os.Signal) (string, erro
 		return "", err
 	}
 
-	if err := cm.networkCaptureProvider.CaptureNetworkPacket(captureFilter, captureDuration, captureMaxSizeMB, sigChan); err != nil {
+	captureFileCount, err := cm.captureFileCount()
+	if err != nil {
+		return "", err
+	}
+
+	if err := cm.networkCaptureProvider.CaptureNetworkPacket(ctx, captureFilter, captureDuration, captureMaxSizeMB, captureFileCount); err != nil {
 		return "", err
 	}
 
@@ -74,6 +91,7 @@ func (cm *CaptureManager) CaptureNetwork(sigChan <-chan os.Signal) (string, erro
 		"filter":      captureFilter,
 		"duration":    strconv.Itoa(captureDuration),
 		"maxSizeMB":   strconv.Itoa(captureMaxSizeMB),
+		"fileCount":   strconv.Itoa(captureFileCount),
 	})
 
 	return tmpLocation, nil
@@ -96,6 +114,14 @@ func (cm *CaptureManager) captureNodeHostName() string {
 	return os.Getenv(captureConstants.NodeHostNameEnvKey)
 }
 
+func (cm *CaptureManager) captureStartTimestamp() (*metav1.Time, error) {
+	timestamp, err := file.StringToTime((os.Getenv(captureConstants.CaptureStartTimestampEnvKey)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse timestamp: %w", err)
+	}
+	return timestamp, nil
+}
+
 func (cm *CaptureManager) captureFilter() string {
 	captureFilter := os.Getenv(captureConstants.TcpdumpFilterEnvKey)
 	if runtime.GOOS == "windows" {
@@ -106,6 +132,9 @@ func (cm *CaptureManager) captureFilter() string {
 
 func (cm *CaptureManager) captureDuration() (int, error) {
 	captureDurationStr := os.Getenv(captureConstants.CaptureDurationEnvKey)
+	if captureDurationStr == "" {
+		return 0, nil
+	}
 	duration, err := time.ParseDuration(captureDurationStr)
 	if err != nil {
 		return 0, err
@@ -137,8 +166,23 @@ func (cm *CaptureManager) captureMaxSizeMB() (int, error) {
 	return strconv.Atoi(captureMaxSizeMBStr)
 }
 
-func (cm *CaptureManager) OutputCapture(srcDir string) error {
-	var errStr string
+func (cm *CaptureManager) captureFileCount() (int, error) {
+	captureFileCountStr := os.Getenv(captureConstants.CaptureFileCountEnvKey)
+	if captureFileCountStr == "" {
+		return 0, nil
+	}
+	count, err := strconv.Atoi(captureFileCountStr)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse file count %q: %w", captureFileCountStr, err)
+	}
+	if count < 0 {
+		return 0, errNegativeFileCount
+	}
+	return count, nil
+}
+
+func (cm *CaptureManager) OutputCapture(ctx context.Context, srcDir string) error {
+	var errs error
 
 	if _, err := os.Stat(srcDir); os.IsNotExist(err) {
 		return fmt.Errorf("capture source directory %s does not exist", srcDir)
@@ -150,13 +194,13 @@ func (cm *CaptureManager) OutputCapture(srcDir string) error {
 	}
 
 	for _, location := range cm.enabledOutputLocations() {
-		if err := location.Output(dstTarGz); err != nil {
-			errStr = errStr + fmt.Sprintf("location %q output error: %s\n", location.Name(), err)
+		if err := location.Output(ctx, dstTarGz); err != nil {
+			errs = fmt.Errorf("%w; location %q output error: %w", errs, location.Name(), err)
 		}
 	}
 
-	if len(errStr) != 0 {
-		return fmt.Errorf(errStr)
+	if errs != nil {
+		return fmt.Errorf("failed to enable output locations: %w", errs)
 	}
 
 	// Remove tarball created inside this function.
@@ -177,6 +221,9 @@ func (cm *CaptureManager) enabledOutputLocations() []captureOutput.Location {
 	}
 	if pvc := captureOutput.NewPersistentVolumeClaim(cm.l); pvc.Enabled() {
 		locations = append(locations, pvc)
+	}
+	if s3 := captureOutput.NewS3Upload(cm.l); s3.Enabled() {
+		locations = append(locations, s3)
 	}
 	return locations
 }

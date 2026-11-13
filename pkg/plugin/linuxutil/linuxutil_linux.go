@@ -11,30 +11,36 @@ import (
 	"time"
 
 	hubblev1 "github.com/cilium/cilium/pkg/hubble/api/v1"
+	lru "github.com/hashicorp/golang-lru/v2"
 	kcfg "github.com/microsoft/retina/pkg/config"
 	"github.com/microsoft/retina/pkg/log"
-	"github.com/microsoft/retina/pkg/plugin/api"
+	"github.com/microsoft/retina/pkg/plugin/registry"
+	"github.com/pkg/errors"
 	"github.com/safchain/ethtool"
 	"go.uber.org/zap"
 )
 
+func init() {
+	registry.Add(name, New)
+}
+
 // New creates a linuxutil plugin.
-func New(cfg *kcfg.Config) api.Plugin {
+func New(cfg *kcfg.Config) registry.Plugin {
 	return &linuxUtil{
 		cfg: cfg,
-		l:   log.Logger().Named(string(Name)),
+		l:   log.Logger().Named(name),
 	}
 }
 
 func (lu *linuxUtil) Name() string {
-	return string(Name)
+	return name
 }
 
-func (lu *linuxUtil) Generate(ctx context.Context) error {
+func (lu *linuxUtil) Generate(context.Context) error {
 	return nil
 }
 
-func (lu *linuxUtil) Compile(ctx context.Context) error {
+func (lu *linuxUtil) Compile(context.Context) error {
 	return nil
 }
 
@@ -48,13 +54,24 @@ func (lu *linuxUtil) Start(ctx context.Context) error {
 	return lu.run(ctx)
 }
 
-func (lu *linuxUtil) SetupChannel(ch chan *hubblev1.Event) error {
-	lu.l.Warn("Plugin does not support SetupChannel", zap.String("plugin", string(Name)))
+func (lu *linuxUtil) SetupChannel(chan *hubblev1.Event) error {
+	lu.l.Debug("Plugin does not support SetupChannel", zap.String("plugin", name))
 	return nil
 }
 
 func (lu *linuxUtil) run(ctx context.Context) error {
 	lu.l.Info("Running linuxutil plugin...")
+
+	// create a LRU cache to skip unsupported interfaces
+	unsupportedInterfacesCache, err := lru.New[string, struct{}](int(defaultLimit))
+	if err != nil {
+		lu.l.Error("failed to create global LRU cache", zap.Error(err))
+		return err
+	}
+
+	gstrings := new(ethtool.EthtoolGStrings)
+	stats := new(ethtool.EthtoolStats)
+
 	ticker := time.NewTicker(lu.cfg.MetricsInterval)
 	defer ticker.Stop()
 
@@ -65,7 +82,7 @@ func (lu *linuxUtil) run(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			opts := &NetstatOpts{
-				CuratedKeys: false,
+				CuratedKeys: true,
 				AddZeroVal:  false,
 				ListenSock:  false,
 			}
@@ -76,28 +93,29 @@ func (lu *linuxUtil) run(ctx context.Context) error {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				err := nsReader.readAndUpdate()
+				_, err := nsReader.readAndUpdate()
 				if err != nil {
 					lu.l.Error("Reading netstat failed", zap.Error(err))
 				}
 			}()
 
 			ethtoolOpts := &EthtoolOpts{
-				errOrDropKeysOnly: false,
+				errOrDropKeysOnly: true,
 				addZeroVal:        false,
 			}
 
 			ethHandle, err := ethtool.NewEthtool()
 			if err != nil {
 				lu.l.Error("Error while creating ethHandle: %v\n", zap.Error(err))
-				return err
+				return fmt.Errorf("failed to create ethHandle: %w", err)
 			}
 
-			ethReader := NewEthtoolReader(ethtoolOpts, ethHandle)
+			ethReader := NewEthtoolReader(ethtoolOpts, ethHandle, unsupportedInterfacesCache, gstrings, stats)
 			if ethReader == nil {
 				lu.l.Error("Error while creating ethReader")
-				return fmt.Errorf("error while creating ethReader")
+				return errors.New("error while creating ethReader")
 			}
+
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -108,6 +126,7 @@ func (lu *linuxUtil) run(ctx context.Context) error {
 			}()
 
 			wg.Wait()
+			ethHandle.Close()
 		}
 	}
 }

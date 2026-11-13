@@ -11,43 +11,53 @@ import (
 	"github.com/microsoft/retina/pkg/log"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
+// Extension field keys for structpb.Struct
+const (
+	ExtKeyBytes                = "bytes"
+	ExtKeyDNSType              = "dns_type"
+	ExtKeyNumResponses         = "num_responses"
+	ExtKeyTCPID                = "tcp_id"
+	ExtKeyDropReason           = "drop_reason"
+	ExtKeyPrevObservedPackets  = "previously_observed_packets"
+	ExtKeyPrevObservedBytes    = "previously_observed_bytes"
+	ExtKeyPrevObservedTCPFlags = "previously_observed_tcp_flags"
+	ExtKeySourceZone           = "source_zone"
+	ExtKeyDestinationZone      = "destination_zone"
+
+	zoneUnknown = "unknown"
+)
+
 // Additional Verdicts to be used for flow objects
 const (
-	Verdict_RETRANSMISSION flow.Verdict = 15
-	Verdict_DNS            flow.Verdict = 16
-	TypeUrl                string       = "retina.sh"
+	Verdict_RETRANSMISSION flow.Verdict = 15          //nolint:revive,stylecheck // existing API, renaming would break callers
+	Verdict_DNS            flow.Verdict = 16          //nolint:revive,stylecheck // existing API, renaming would break callers
+	TypeUrl                string       = "retina.sh" //nolint:revive,stylecheck // existing API, renaming would break callers
 )
 
 // ToFlow returns a flow.Flow object.
 // This sets up a L3/L4 flow object.
-// sourceIP, destIP are IPv4 addresses.
+// sourceIP, destIP are IPv4 or IPv6 addresses; IpVersion is derived from the
+// address family via net.IP.To4().
 // sourcePort, destPort are TCP/UDP ports.
 // proto is the protocol number. Ref: https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml .
 // observationPoint is the observation point+direction of the flow. 0 is from n/w stack to container, 1 is from container to stack,
 // 2 is from host to network and 3 is from network to host.
 // ts is the timestamp in nanoseconds.
 func ToFlow(
+	l *log.ZapLogger,
 	ts int64,
 	sourceIP, destIP net.IP,
 	sourcePort, destPort uint32,
 	proto uint8,
-	observationPoint uint32,
+	observationPoint uint8,
 	verdict flow.Verdict,
-	dropReason uint32,
 ) *flow.Flow { //nolint:typecheck
-	var (
-		l4           *flow.Layer4
-		checkpoint   flow.TraceObservationPoint
-		direction    flow.TrafficDirection
-		subeventtype int
-	)
-
-	l := log.Logger().Named("ToFlow")
-
+	var l4 *flow.Layer4
 	switch proto {
 	case 6:
 		l4 = &flow.Layer4{
@@ -69,23 +79,28 @@ func ToFlow(
 		}
 	}
 
+	var (
+		checkpoint   flow.TraceObservationPoint
+		subeventtype int
+		direction    flow.TrafficDirection
+	)
 	// We are attaching the filters to the veth interface on the host side.
 	// So for HOST -> CONTAINER, egress of host veth is ingress of container.
 	// Hence, we need to swap the direction.
 	switch observationPoint {
-	case uint32(0):
+	case uint8(0): //nolint:gomnd // flow.TraceObservationPoint_TO_STACK
 		checkpoint = flow.TraceObservationPoint_TO_STACK
 		direction = flow.TrafficDirection_EGRESS
 		subeventtype = int(api.TraceToStack)
-	case uint32(1):
+	case uint8(1): //nolint:gomnd // flow.TraceObservationPoint_TO_ENDPOINT
 		checkpoint = flow.TraceObservationPoint_TO_ENDPOINT
 		direction = flow.TrafficDirection_INGRESS
 		subeventtype = int(api.TraceToLxc)
-	case uint32(2):
+	case uint8(2): //nolint:gomnd // flow.TraceObservationPoint_FROM_NETWORK
 		checkpoint = flow.TraceObservationPoint_FROM_NETWORK
 		direction = flow.TrafficDirection_INGRESS
 		subeventtype = int(api.TraceFromNetwork)
-	case uint32(3):
+	case uint8(3): //nolint:gomnd // flow.TraceObservationPoint_TO_NETWORK
 		checkpoint = flow.TraceObservationPoint_TO_NETWORK
 		direction = flow.TrafficDirection_EGRESS
 		subeventtype = int(api.TraceToNetwork)
@@ -98,7 +113,10 @@ func ToFlow(
 		verdict = flow.Verdict_FORWARDED
 	}
 
-	ext, _ := anypb.New(&RetinaMetadata{}) //nolint:typecheck
+	ipVersion := flow.IPVersion_IPv4
+	if sourceIP.To4() == nil {
+		ipVersion = flow.IPVersion_IPv6
+	}
 
 	f := &flow.Flow{
 		Type: flow.FlowType_L3_L4,
@@ -109,16 +127,16 @@ func ToFlow(
 		IP: &flow.IP{
 			Source:      sourceIP.String(),
 			Destination: destIP.String(),
-			// We only support IPv4 for now.
-			IpVersion: flow.IPVersion_IPv4,
+			IpVersion:   ipVersion,
 		},
 		L4:                    l4,
 		TraceObservationPoint: checkpoint,
-		TrafficDirection:      direction,
-		Verdict:               verdict,
-		DropReason:            dropReason,
-		Extensions:            ext,
-		IsReply:               &wrapperspb.BoolValue{Value: false}, // Setting false by default as we don't have a better way to determine flow direction.
+		// Packetparser running with conntrack can determine the traffic direction correctly and will override this value.
+		TrafficDirection: direction,
+		Verdict:          verdict,
+		// Setting IsReply to false by default.
+		// Packetparser running with conntrack can determine the direction of the flow, and will override this value.
+		IsReply: &wrapperspb.BoolValue{Value: false},
 	}
 	if t, err := decodeTime(ts); err == nil {
 		f.Time = t
@@ -128,45 +146,177 @@ func ToFlow(
 	return f
 }
 
-func AddTcpFlags(f *flow.Flow, syn, ack, fin, rst, psh, urg uint16) {
-	if f.L4.GetTCP() == nil {
+// NewExtensions creates a new structpb.Struct for use as flow extensions.
+func NewExtensions() *structpb.Struct {
+	return &structpb.Struct{Fields: make(map[string]*structpb.Value)}
+}
+
+// SetExtensions wraps the struct in Any and sets it on the flow.
+// Only call this after populating all extension fields.
+func SetExtensions(f *flow.Flow, s *structpb.Struct) {
+	if f == nil || s == nil || len(s.GetFields()) == 0 {
+		return
+	}
+	ext, _ := anypb.New(s)
+	f.Extensions = ext
+}
+
+// GetExtensionsStruct extracts the structpb.Struct from flow.Extensions.
+// Returns nil if Extensions is nil or not a Struct.
+func GetExtensionsStruct(f *flow.Flow) *structpb.Struct {
+	if f == nil || f.GetExtensions() == nil {
+		return nil
+	}
+	s := &structpb.Struct{}
+	if err := f.GetExtensions().UnmarshalTo(s); err != nil {
+		return nil
+	}
+	return s
+}
+
+func AddTCPFlags(f *flow.Flow, syn, ack, fin, rst, psh, urg, ece, cwr, ns uint16) {
+	if f.GetL4().GetTCP() == nil {
 		return
 	}
 
-	f.L4.GetTCP().Flags = &flow.TCPFlags{
+	f.GetL4().GetTCP().Flags = &flow.TCPFlags{
 		SYN: syn == uint16(1),
 		ACK: ack == uint16(1),
 		FIN: fin == uint16(1),
 		RST: rst == uint16(1),
 		PSH: psh == uint16(1),
 		URG: urg == uint16(1),
+		ECE: ece == uint16(1),
+		CWR: cwr == uint16(1),
+		NS:  ns == uint16(1),
 	}
 }
 
-// Add TSval/TSecr to the flow as TCP ID.
-// The TSval/TSecr works as ID for the flow.
-// We will use this ID to calculate latency.
-func AddTcpID(f *flow.Flow, id uint64) {
-	if f.L4 == nil || f.L4.GetTCP() == nil {
+// AddPreviouslyObservedTCPFlags adds the previously observed TCP flags to the flow's extensions.
+func AddPreviouslyObservedTCPFlags(s *structpb.Struct, syn, ack, fin, rst, psh, urg, ece, cwr, ns uint32) {
+	if s == nil {
 		return
 	}
-	k := &RetinaMetadata{}      //nolint:typecheck
-	f.Extensions.UnmarshalTo(k) //nolint:errcheck
-	k.TcpId = id
-	f.Extensions, _ = anypb.New(k) //nolint:errcheck
+	// Only add if at least one flag is non-zero
+	if syn == 0 && ack == 0 && fin == 0 && rst == 0 && psh == 0 && urg == 0 && ece == 0 && cwr == 0 && ns == 0 {
+		return
+	}
+	tcpFlags := &structpb.Struct{Fields: map[string]*structpb.Value{
+		SYN: structpb.NewNumberValue(float64(syn)),
+		ACK: structpb.NewNumberValue(float64(ack)),
+		FIN: structpb.NewNumberValue(float64(fin)),
+		RST: structpb.NewNumberValue(float64(rst)),
+		PSH: structpb.NewNumberValue(float64(psh)),
+		URG: structpb.NewNumberValue(float64(urg)),
+		ECE: structpb.NewNumberValue(float64(ece)),
+		CWR: structpb.NewNumberValue(float64(cwr)),
+		NS:  structpb.NewNumberValue(float64(ns)),
+	}}
+	s.GetFields()[ExtKeyPrevObservedTCPFlags] = structpb.NewStructValue(tcpFlags)
 }
 
-func GetTcpID(f *flow.Flow) uint64 {
-	if f.L4 == nil || f.L4.GetTCP() == nil {
+func PreviouslyObservedTCPFlags(f *flow.Flow) map[string]uint32 {
+	s := GetExtensionsStruct(f)
+	if s == nil {
+		return nil
+	}
+	v, ok := s.GetFields()[ExtKeyPrevObservedTCPFlags]
+	if !ok || v.GetStructValue() == nil {
+		return nil
+	}
+	result := make(map[string]uint32)
+	for k, val := range v.GetStructValue().GetFields() {
+		result[k] = uint32(val.GetNumberValue())
+	}
+	return result
+}
+
+// AddPreviouslyObservedBytes adds the previously observed bytes to the flow's extensions.
+func AddPreviouslyObservedBytes(s *structpb.Struct, bytes uint32) {
+	if s == nil || bytes == 0 {
+		return
+	}
+	s.GetFields()[ExtKeyPrevObservedBytes] = structpb.NewNumberValue(float64(bytes))
+}
+
+func PreviouslyObservedBytes(f *flow.Flow) uint32 {
+	s := GetExtensionsStruct(f)
+	if s == nil {
 		return 0
 	}
-	k := &RetinaMetadata{}      //nolint:typecheck
-	f.Extensions.UnmarshalTo(k) //nolint:errcheck
-	return k.TcpId
+	v, ok := s.GetFields()[ExtKeyPrevObservedBytes]
+	if !ok {
+		return 0
+	}
+	return uint32(v.GetNumberValue())
 }
 
-func AddDnsInfo(f *flow.Flow, qType string, rCode uint32, query string, qTypes []string, numAnswers int, ips []string) {
-	if f == nil {
+// AddPreviouslyObservedPackets adds the previously observed packets to the flow's extensions.
+func AddPreviouslyObservedPackets(s *structpb.Struct, packets uint32) {
+	if s == nil || packets == 0 {
+		return
+	}
+	s.GetFields()[ExtKeyPrevObservedPackets] = structpb.NewNumberValue(float64(packets))
+}
+
+func PreviouslyObservedPackets(f *flow.Flow) uint32 {
+	s := GetExtensionsStruct(f)
+	if s == nil {
+		return 0
+	}
+	v, ok := s.GetFields()[ExtKeyPrevObservedPackets]
+	if !ok {
+		return 0
+	}
+	return uint32(v.GetNumberValue())
+}
+
+func AddTCPFlagsBool(f *flow.Flow, syn, ack, fin, rst, psh, urg bool) {
+	if f.GetL4().GetTCP() == nil {
+		return
+	}
+
+	f.L4.GetTCP().Flags = &flow.TCPFlags{
+		SYN: syn,
+		ACK: ack,
+		FIN: fin,
+		RST: rst,
+		PSH: psh,
+		URG: urg,
+	}
+}
+
+// AddTCPID adds TSval/TSecr to the flow's extensions as TCP ID.
+// The TSval/TSecr works as ID for the flow.
+// We will use this ID to calculate latency.
+func AddTCPID(s *structpb.Struct, id uint64) {
+	if s == nil || id == 0 {
+		return
+	}
+	s.GetFields()[ExtKeyTCPID] = structpb.NewNumberValue(float64(id))
+}
+
+func GetTCPID(f *flow.Flow) uint64 {
+	if f.GetL4() == nil || f.GetL4().GetTCP() == nil {
+		return 0
+	}
+	s := GetExtensionsStruct(f)
+	if s == nil {
+		return 0
+	}
+	v, ok := s.GetFields()[ExtKeyTCPID]
+	if !ok {
+		return 0
+	}
+	return uint64(v.GetNumberValue())
+}
+
+// AddDNSInfo adds DNS information to the flow and its extensions.
+func AddDNSInfo(
+	f *flow.Flow, s *structpb.Struct, qType string, rCode uint32,
+	query string, qTypes []string, numAnswers int, ips []string,
+) {
+	if f == nil || s == nil {
 		return
 	}
 	// Set type to L7.
@@ -186,40 +336,52 @@ func AddDnsInfo(f *flow.Flow, qType string, rCode uint32, query string, qTypes [
 	f.L7 = &flow.Layer7{
 		Record: &l7,
 	}
-	k := &RetinaMetadata{}      //nolint:typecheck
-	f.Extensions.UnmarshalTo(k) //nolint:errcheck
 	switch qType {
 	case "Q":
-		k.DnsType = DNSType_QUERY
+		s.GetFields()[ExtKeyDNSType] = structpb.NewStringValue(DNSType_QUERY.String())
 		f.L7.Type = flow.L7FlowType_REQUEST
 	case "R":
-		k.DnsType = DNSType_RESPONSE
+		s.GetFields()[ExtKeyDNSType] = structpb.NewStringValue(DNSType_RESPONSE.String())
 		f.L7.Type = flow.L7FlowType_RESPONSE
 		f.IsReply = &wrapperspb.BoolValue{Value: true} // we can definitely say that this is a reply
 	default:
-		k.DnsType = DNSType_UNKNOWN
 		f.L7.Type = flow.L7FlowType_UNKNOWN_L7_TYPE
 	}
-	k.NumResponses = uint32(numAnswers)
-	f.Extensions, _ = anypb.New(k)
+	if numAnswers > 0 {
+		s.GetFields()[ExtKeyNumResponses] = structpb.NewNumberValue(float64(numAnswers))
+	}
 }
 
-func GetDns(f *flow.Flow) (*flow.DNS, DNSType, uint32) {
+func GetDNS(f *flow.Flow) (*flow.DNS, DNSType, uint32) {
 	if f == nil || f.L7 == nil || f.L7.GetDns() == nil {
 		return nil, DNSType_UNKNOWN, 0
 	}
 	dns := f.L7.GetDns()
-	if f.Extensions == nil {
+	s := GetExtensionsStruct(f)
+	if s == nil {
 		return dns, DNSType_UNKNOWN, 0
 	}
-	k := &RetinaMetadata{}      //nolint:typecheck
-	f.Extensions.UnmarshalTo(k) //nolint:errcheck
 
-	return dns, k.DnsType, k.NumResponses
+	dnsType := DNSType_UNKNOWN
+	if v, ok := s.GetFields()[ExtKeyDNSType]; ok {
+		switch v.GetStringValue() {
+		case DNSType_QUERY.String():
+			dnsType = DNSType_QUERY
+		case DNSType_RESPONSE.String():
+			dnsType = DNSType_RESPONSE
+		}
+	}
+
+	var numResponses uint32
+	if v, ok := s.GetFields()[ExtKeyNumResponses]; ok {
+		numResponses = uint32(v.GetNumberValue())
+	}
+
+	return dns, dnsType, numResponses
 }
 
 // DNS Return code to string.
-func DnsRcodeToString(f *flow.Flow) string {
+func DNSRcodeToString(f *flow.Flow) string {
 	if f == nil || f.L7 == nil || f.L7.GetDns() == nil {
 		return ""
 	}
@@ -241,23 +403,71 @@ func DnsRcodeToString(f *flow.Flow) string {
 	}
 }
 
-func AddPacketSize(f *flow.Flow, packetSize uint64) {
-	if f.Extensions == nil {
+// AddPacketSize adds the packet size to the flow's extensions.
+func AddPacketSize(s *structpb.Struct, packetSize uint32) {
+	if s == nil || packetSize == 0 {
 		return
 	}
-	k := &RetinaMetadata{}      //nolint:typecheck
-	f.Extensions.UnmarshalTo(k) //nolint:errcheck
-	k.Bytes = packetSize
-	f.Extensions, _ = anypb.New(k)
+	s.GetFields()[ExtKeyBytes] = structpb.NewNumberValue(float64(packetSize))
 }
 
-func PacketSize(f *flow.Flow) uint64 {
-	if f.Extensions == nil {
+func PacketSize(f *flow.Flow) uint32 {
+	s := GetExtensionsStruct(f)
+	if s == nil {
 		return 0
 	}
-	k := &RetinaMetadata{}      //nolint:typecheck
-	f.Extensions.UnmarshalTo(k) //nolint:errcheck
-	return k.Bytes
+	v, ok := s.GetFields()[ExtKeyBytes]
+	if !ok {
+		return 0
+	}
+	return uint32(v.GetNumberValue())
+}
+
+// AddDropReason adds the drop reason to the flow and its extensions.
+func AddDropReason(f *flow.Flow, s *structpb.Struct, dropReason uint16) {
+	if f == nil || s == nil {
+		return
+	}
+
+	dr := DropReason(dropReason)
+	AddDropReasonDescription(s, dr)
+
+	f.Verdict = flow.Verdict_DROPPED
+
+	// Set the drop reason.
+	// Retina drop reasons are different from the drop reasons available in flow library.
+	// We map the ones available in flow library to the ones available in Retina.
+	// Rest are set to UNKNOWN. The details are added in the extensions.
+	f.DropReasonDesc = GetDropReasonDesc(dr)
+
+	f.EventType = &flow.CiliumEventType{
+		Type:    int32(api.MessageTypeDrop),
+		SubType: int32(f.GetDropReasonDesc()), // This is the drop reason.
+	}
+}
+
+// AddDropReasonDescription adds a Retina drop reason to flow extensions
+// without changing the flow's event type.
+func AddDropReasonDescription(s *structpb.Struct, dropReason DropReason) {
+	if s == nil {
+		return
+	}
+	s.GetFields()[ExtKeyDropReason] = structpb.NewStringValue(dropReason.String())
+}
+
+func DropReasonDescription(f *flow.Flow) string {
+	if f == nil {
+		return ""
+	}
+	s := GetExtensionsStruct(f)
+	if s == nil {
+		return ""
+	}
+	v, ok := s.GetFields()[ExtKeyDropReason]
+	if !ok {
+		return ""
+	}
+	return v.GetStringValue()
 }
 
 func decodeTime(nanoseconds int64) (pbTime *timestamppb.Timestamp, err error) {
@@ -270,4 +480,39 @@ func decodeTime(nanoseconds int64) (pbTime *timestamppb.Timestamp, err error) {
 		return nil, err
 	}
 	return pbTime, nil
+}
+
+// AddZones adds source and destination availability zones to the flow's extensions.
+func AddZones(s *structpb.Struct, srcZone, dstZone string) {
+	if s == nil {
+		return
+	}
+	s.GetFields()[ExtKeySourceZone] = structpb.NewStringValue(srcZone)
+	s.GetFields()[ExtKeyDestinationZone] = structpb.NewStringValue(dstZone)
+}
+
+// SourceZone returns the source availability zone from the flow's extensions.
+func SourceZone(f *flow.Flow) string {
+	s := GetExtensionsStruct(f)
+	if s == nil {
+		return zoneUnknown
+	}
+	v, ok := s.GetFields()[ExtKeySourceZone]
+	if !ok {
+		return zoneUnknown
+	}
+	return v.GetStringValue()
+}
+
+// DestinationZone returns the destination availability zone from the flow's extensions.
+func DestinationZone(f *flow.Flow) string {
+	s := GetExtensionsStruct(f)
+	if s == nil {
+		return zoneUnknown
+	}
+	v, ok := s.GetFields()[ExtKeyDestinationZone]
+	if !ok {
+		return zoneUnknown
+	}
+	return v.GetStringValue()
 }

@@ -12,33 +12,102 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type packetparserCtEntry struct {
+	EvictionTime                    uint32
+	LastReportTxDir                 uint32
+	LastReportRxDir                 uint32
+	BytesSeenSinceLastReportTxDir   uint32
+	BytesSeenSinceLastReportRxDir   uint32
+	PacketsSeenSinceLastReportTxDir uint32
+	PacketsSeenSinceLastReportRxDir uint32
+	FlagsSeenSinceLastReportTxDir   struct {
+		Syn uint32
+		Ack uint32
+		Fin uint32
+		Rst uint32
+		Psh uint32
+		Urg uint32
+		Ece uint32
+		Cwr uint32
+		Ns  uint32
+	}
+	FlagsSeenSinceLastReportRxDir struct {
+		Syn uint32
+		Ack uint32
+		Fin uint32
+		Rst uint32
+		Psh uint32
+		Urg uint32
+		Ece uint32
+		Cwr uint32
+		Ns  uint32
+	}
+	TrafficDirection   uint8
+	FlagsSeenTxDir     uint8
+	FlagsSeenRxDir     uint8
+	IsDirectionUnknown bool
+	ConntrackMetadata  struct {
+		BytesTxCount   uint64
+		BytesRxCount   uint64
+		PacketsTxCount uint32
+		PacketsRxCount uint32
+	}
+}
+
+type packetparserCtV4Key struct {
+	SrcIp   uint32
+	DstIp   uint32
+	SrcPort uint16
+	DstPort uint16
+	Proto   uint8
+	_       [3]byte
+}
+
 type packetparserMapKey struct {
 	Prefixlen uint32
 	Data      uint32
 }
 
 type packetparserPacket struct {
+	T_nsec      uint64
+	Bytes       uint32
 	SrcIp       uint32
 	DstIp       uint32
 	SrcPort     uint16
 	DstPort     uint16
-	Proto       uint8
-	_           [3]byte
 	TcpMetadata struct {
 		Seq    uint32
 		AckNum uint32
-		Syn    uint16
-		Ack    uint16
-		Fin    uint16
-		Rst    uint16
-		Psh    uint16
-		Urg    uint16
 		Tsval  uint32
 		Tsecr  uint32
 	}
-	Dir   uint32
-	Ts    uint64
-	Bytes uint64
+	ObservationPoint          uint8
+	TrafficDirection          uint8
+	Proto                     uint8
+	_                         [1]byte
+	Flags                     uint16
+	IsReply                   bool
+	_                         [1]byte
+	PreviouslyObservedPackets uint32
+	PreviouslyObservedBytes   uint32
+	PreviouslyObservedFlags   struct {
+		Syn uint32
+		Ack uint32
+		Fin uint32
+		Rst uint32
+		Psh uint32
+		Urg uint32
+		Ece uint32
+		Cwr uint32
+		Ns  uint32
+	}
+	_                 [4]byte
+	ConntrackMetadata struct {
+		BytesTxCount   uint64
+		BytesRxCount   uint64
+		PacketsTxCount uint32
+		PacketsRxCount uint32
+	}
 }
 
 // loadPacketparser returns the embedded CollectionSpec for packetparser.
@@ -92,8 +161,10 @@ type packetparserProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type packetparserMapSpecs struct {
-	PacketparserEvents *ebpf.MapSpec `ebpf:"packetparser_events"`
-	RetinaFilterMap    *ebpf.MapSpec `ebpf:"retina_filter_map"`
+	RetinaConntrack           *ebpf.MapSpec `ebpf:"retina_conntrack"`
+	RetinaFilter              *ebpf.MapSpec `ebpf:"retina_filter"`
+	RetinaPacketparserEvents  *ebpf.MapSpec `ebpf:"retina_packetparser_events"`
+	RetinaPacketparserMetrics *ebpf.MapSpec `ebpf:"retina_packetparser_metrics"`
 }
 
 // packetparserObjects contains all objects after they have been loaded into the kernel.
@@ -115,14 +186,18 @@ func (o *packetparserObjects) Close() error {
 //
 // It can be passed to loadPacketparserObjects or ebpf.CollectionSpec.LoadAndAssign.
 type packetparserMaps struct {
-	PacketparserEvents *ebpf.Map `ebpf:"packetparser_events"`
-	RetinaFilterMap    *ebpf.Map `ebpf:"retina_filter_map"`
+	RetinaConntrack           *ebpf.Map `ebpf:"retina_conntrack"`
+	RetinaFilter              *ebpf.Map `ebpf:"retina_filter"`
+	RetinaPacketparserEvents  *ebpf.Map `ebpf:"retina_packetparser_events"`
+	RetinaPacketparserMetrics *ebpf.Map `ebpf:"retina_packetparser_metrics"`
 }
 
 func (m *packetparserMaps) Close() error {
 	return _PacketparserClose(
-		m.PacketparserEvents,
-		m.RetinaFilterMap,
+		m.RetinaConntrack,
+		m.RetinaFilter,
+		m.RetinaPacketparserEvents,
+		m.RetinaPacketparserMetrics,
 	)
 }
 

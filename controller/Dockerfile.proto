@@ -1,15 +1,18 @@
-FROM --platform=linux/amd64 mcr.microsoft.com/oss/go/microsoft/golang:1.21 AS proto-tools
+# skopeo inspect docker://mcr.microsoft.com/oss/go/microsoft/golang:1.26-azurelinux3.0 --format "{{.Name}}@{{.Digest}}"
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/oss/go/microsoft/golang:1.26-azurelinux3.0@sha256:ed6bde29ab1d8e2ee55cacb3bff7f8f073bb74d4529833c4fee77d647cdeaeda
+
 LABEL Name=retina-builder Version=0.0.1
 
-RUN apt-get update &&\
-    apt-get -y install lsb-release wget software-properties-common gnupg file git make unzip
+RUN tdnf install -y unzip
 
 WORKDIR /tmp
 
-RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.31.0
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2
 RUN wget https://github.com/protocolbuffers/protobuf/releases/download/v24.2/protoc-24.2-linux-x86_64.zip
 RUN unzip protoc-24.2-linux-x86_64.zip -d protoc
 RUN mv protoc/bin/protoc /usr/bin/protoc
 
 WORKDIR /app
-ENTRYPOINT protoc -I=. --go_out=paths=source_relative:. ./pkg/utils/metadata.proto
+ENTRYPOINT /bin/sh -c "protoc -I=. --go_out=paths=source_relative:. ./pkg/utils/metadata_linux.proto && \
+	protoc -I=. --go_out=paths=source_relative:. ./pkg/utils/metadata_darwin.proto && \
+	protoc -I=. --go_out=paths=source_relative:. ./pkg/utils/metadata_windows.proto"

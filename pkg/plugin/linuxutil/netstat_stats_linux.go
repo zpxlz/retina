@@ -4,6 +4,7 @@ package linuxutil
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -16,8 +17,9 @@ import (
 )
 
 const (
-	pathNetNetstat = "/proc/net/netstat"
-	pathNetSnmp    = "/proc/net/snmp"
+	pathNetNetstat       = "/proc/net/netstat"
+	pathNetSnmp          = "/proc/net/snmp"
+	addrDefaultTCPRemote = "AllIPs"
 )
 
 type NetstatReader struct {
@@ -38,20 +40,21 @@ func NewNetstatReader(opts *NetstatOpts, ns NetstatInterface) *NetstatReader {
 	}
 }
 
-func (nr *NetstatReader) readAndUpdate() error {
+func (nr *NetstatReader) readAndUpdate() (*SocketStats, error) {
+	metrics.TCPConnectionRemoteGauge.WithLabelValues(addrDefaultTCPRemote).Set(0)
 	if err := nr.readConnectionStats(pathNetNetstat); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Get Socket stats
 	if err := nr.readSockStats(); err != nil {
-		return err
+		return nil, err
 	}
 
 	nr.updateMetrics()
 	nr.l.Debug("Done reading and updating connections stats")
 
-	return nil
+	return &nr.connStats.TcpSockets, nil
 }
 
 //nolint:gomnd // magic numbers are sufficiently explained in this function
@@ -212,17 +215,17 @@ func (nr *NetstatReader) updateMetrics() {
 	}
 	// Adding TCP Connection Stats
 	for statName, val := range nr.connStats.TcpExt {
-		metrics.TCPConnectionStats.WithLabelValues(statName).Set(float64(val))
+		metrics.TCPConnectionStatsGauge.WithLabelValues(statName).Set(float64(val))
 	}
 
 	// Adding IP Stats
 	for statName, val := range nr.connStats.IpExt {
-		metrics.IPConnectionStats.WithLabelValues(statName).Set(float64(val))
+		metrics.IPConnectionStatsGauge.WithLabelValues(statName).Set(float64(val))
 	}
 
 	// Adding MPTCP Stats
 	for statName, val := range nr.connStats.MPTcpExt {
-		metrics.TCPConnectionStats.WithLabelValues(statName).Set(float64(val))
+		metrics.TCPConnectionStatsGauge.WithLabelValues(statName).Set(float64(val))
 	}
 
 	// TCP COnnection State and remote addr metrics
@@ -230,36 +233,17 @@ func (nr *NetstatReader) updateMetrics() {
 		metrics.TCPStateGauge.WithLabelValues(state).Set(float64(v))
 	}
 
+	totalCount := 0
 	for remoteAddr, v := range nr.connStats.TcpSockets.socketByRemoteAddr {
-		addr := ""
-		port := ""
-		splitAddr := strings.Split(remoteAddr, ":")
-		if len(splitAddr) == 2 {
-			addr = splitAddr[0]
-			port = splitAddr[1]
-		} else {
-			addr = remoteAddr
-		}
-		if !validateRemoteAddr(addr) {
+		// only count valid remote addresses
+		if _, err := netip.ParseAddrPort(remoteAddr); err != nil {
+			nr.l.Error("failed to parse remote address", zap.String("remoteAddr", remoteAddr), zap.Error(err))
 			continue
 		}
-
-		metrics.TCPConnectionRemoteGauge.WithLabelValues(addr, port).Set(float64(v))
+		totalCount += v
 	}
+	metrics.TCPConnectionRemoteGauge.WithLabelValues(addrDefaultTCPRemote).Set(float64(totalCount))
 
 	// UDP COnnection State metrics
-	metrics.UDPConnectionStats.WithLabelValues(utils.Active).Set(float64(nr.connStats.UdpSockets.totalActiveSockets))
-}
-
-func validateRemoteAddr(addr string) bool {
-	if addr == "" {
-		return false
-	}
-
-	// ignore localhost addresses.
-	if strings.Contains(addr, "127.0.0") {
-		return false
-	}
-
-	return true
+	metrics.UDPConnectionStatsGauge.WithLabelValues(utils.Active).Set(float64(nr.connStats.UdpSockets.totalActiveSockets))
 }
